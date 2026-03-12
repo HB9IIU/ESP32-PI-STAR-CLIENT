@@ -269,18 +269,71 @@ fi
 # ---------------------------------------------------------
 # [12/13] Install or refresh service
 # ---------------------------------------------------------
-step 12 "⚙️ Checking and installing systemd service..."
+step 12 "⚙️ Installing systemd service..."
 
-if systemctl list-unit-files | grep -q "^${SERVICE_NAME}"; then
-    ok "service already installed"
-else
-    info "service not installed yet"
-fi
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 
-bash <(curl -fsSL "${SERVICE_INSTALLER_URL}") || die "service installer failed"
-ok "service installer completed"
+sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
+[Unit]
+Description=MMDVM WebSocket Monitor
+After=network-online.target
+Wants=network-online.target
 
-sudo systemctl daemon-reload || true
-sudo systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+[Service]
+Type=simple
+User=pi-star
+WorkingDirectory=/home/pi-star
+ExecStart=/usr/bin/python3 ${PY_SCRIPT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+ok "service file written to ${SERVICE_FILE}"
+
+sudo chmod 644 "${SERVICE_FILE}" || die "failed to chmod service file"
+sudo systemctl daemon-reload || die "systemctl daemon-reload failed"
+sudo systemctl enable "${SERVICE_NAME}" || die "failed to enable ${SERVICE_NAME}"
 sudo systemctl restart "${SERVICE_NAME}" || die "failed to restart ${SERVICE_NAME}"
 ok "service restarted"
+
+# ---------------------------------------------------------
+# [13/13] Final verification
+# ---------------------------------------------------------
+step 13 "✅ Final verification..."
+
+if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    ok "service is active"
+else
+    warn "service is not active"
+fi
+
+if sudo ss -ltnp 2>/dev/null | grep -q ":${WS_PORT} "; then
+    ok "port ${WS_PORT} is listening"
+else
+    warn "port ${WS_PORT} is not currently listening"
+fi
+
+if [ -f "${PISTAR_FIREWALL_SCRIPT}" ] && grep -Fq -- "--dport ${WS_PORT}" "${PISTAR_FIREWALL_SCRIPT}"; then
+    ok "permanent Pi-Star firewall rule for port ${WS_PORT} is present"
+else
+    warn "permanent Pi-Star firewall rule for port ${WS_PORT} is missing"
+fi
+
+echo
+echo "========================================================="
+echo " ✅ Installation complete"
+echo "========================================================="
+echo " Python      : ${PYVER}"
+echo " websockets  : ${WS_VER}"
+echo " script      : ${PY_SCRIPT}"
+echo " service     : ${SERVICE_NAME}"
+echo " port        : ${WS_PORT}"
+echo
+echo " Useful commands:"
+echo "   sudo systemctl status ${SERVICE_NAME} --no-pager"
+echo "   journalctl -u ${SERVICE_NAME} -f"
+echo "   python3 ${PY_SCRIPT}"
+echo "========================================================="
