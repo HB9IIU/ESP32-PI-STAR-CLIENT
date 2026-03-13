@@ -1,0 +1,1 @@
+bash <(curl -fsSL https://raw.githubusercontent.com/HB9IIU/ESP32-PI-STAR-CLIENT/main/InstallationFiles/install_all.sh)
