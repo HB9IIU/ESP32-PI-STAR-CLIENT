@@ -290,6 +290,15 @@ def normalize_callsign(value):
     return str(value).strip().upper()
 
 
+def looks_like_real_callsign(value):
+    normalized = normalize_callsign(value)
+    if not normalized:
+        return False
+    if normalized.isdigit():
+        return False
+    return any(character.isalpha() for character in normalized)
+
+
 def empty_radioid_record():
     return {
         "match_count": 0,
@@ -419,7 +428,16 @@ def update_heard_callsigns_from_live_state():
     if LIVE_STATE["last_event"] not in ("rf_voice_header", "network_voice_header"):
         return False
 
-    callsign = normalize_callsign(LIVE_STATE["source_callsign"] or LIVE_STATE["source"])
+    preferred_callsign = LIVE_STATE["source_callsign"]
+    fallback_callsign = LIVE_STATE["source"]
+
+    if looks_like_real_callsign(preferred_callsign):
+        callsign = normalize_callsign(preferred_callsign)
+    elif looks_like_real_callsign(fallback_callsign):
+        callsign = normalize_callsign(fallback_callsign)
+    else:
+        return False
+
     if not callsign:
         return False
 
