@@ -13,6 +13,7 @@
 
 constexpr size_t MAX_CONFIG_JSON_LENGTH = 8192;
 constexpr size_t MAX_RSSI_VALUES = 16;
+constexpr size_t MAX_HEARD_RECENT_ITEMS = 10;
 
 struct SnapshotState {
     char type[16];
@@ -82,6 +83,24 @@ struct LiveState {
     bool valid;
 } g_live;
 
+struct HeardRecentItem {
+    char callsign[24];
+    char name[32];
+    char country_code[4];
+    char last_seen[32];
+    char last_tg[32];
+};
+
+struct HeardSummaryState {
+    char type[20];
+    int unique_callsigns_total;
+    char last_heard_callsign[24];
+    char last_heard_at[32];
+    HeardRecentItem recent[MAX_HEARD_RECENT_ITEMS];
+    size_t recent_count;
+    bool valid;
+} g_heardSummary;
+
 WebSocketsClient ws;
 
 // Helpers
@@ -94,6 +113,11 @@ void clearSnapshotState() {
 void clearLiveState() {
     memset(&g_live, 0, sizeof(g_live));
     strlcpy(g_live.type, "live", sizeof(g_live.type));
+}
+
+void clearHeardSummaryState() {
+    memset(&g_heardSummary, 0, sizeof(g_heardSummary));
+    strlcpy(g_heardSummary.type, "heard_summary", sizeof(g_heardSummary.type));
 }
 
 void copyJsonString(JsonVariantConst value, char* destination, size_t destinationSize) {
@@ -214,6 +238,28 @@ void printSnapshot(JsonVariantConst configVariant) {
     Serial.printf("Station Country   : %s\n", g_snapshot.station_country);
     Serial.printf("Station ISO Code  : %s\n", g_snapshot.station_country_code);
     printConfigSections(configVariant);
+    Serial.println("========================================");
+}
+
+void printHeardSummary() {
+    printDivider("HEARD SUMMARY");
+    Serial.printf("Type              : %s\n", g_heardSummary.type);
+    Serial.printf("Unique Callsigns  : %d\n", g_heardSummary.unique_callsigns_total);
+    Serial.printf("Last Heard        : %s\n", g_heardSummary.last_heard_callsign);
+    Serial.printf("Last Heard At     : %s\n", g_heardSummary.last_heard_at);
+    Serial.printf("Recent Entries    : %u\n", static_cast<unsigned>(g_heardSummary.recent_count));
+
+    for (size_t index = 0; index < g_heardSummary.recent_count; ++index) {
+        const HeardRecentItem& item = g_heardSummary.recent[index];
+        Serial.printf("  %u. %s | %s | %s | %s\n",
+            static_cast<unsigned>(index + 1),
+            item.callsign,
+            item.name,
+            item.country_code,
+            item.last_tg);
+        Serial.printf("     Last Seen: %s\n", item.last_seen);
+    }
+
     Serial.println("========================================");
 }
 
@@ -383,6 +429,35 @@ void parseLive(JsonDocument& doc) {
     printLive();
 }
 
+void parseHeardSummary(JsonDocument& doc) {
+    clearHeardSummaryState();
+
+    copyJsonString(doc["type"], g_heardSummary.type, sizeof(g_heardSummary.type));
+    g_heardSummary.unique_callsigns_total = doc["unique_callsigns_total"] | 0;
+    copyJsonString(doc["last_heard_callsign"], g_heardSummary.last_heard_callsign, sizeof(g_heardSummary.last_heard_callsign));
+    copyJsonString(doc["last_heard_at"], g_heardSummary.last_heard_at, sizeof(g_heardSummary.last_heard_at));
+
+    JsonArrayConst recentArray = doc["recent"].as<JsonArrayConst>();
+    g_heardSummary.recent_count = 0;
+    if (!recentArray.isNull()) {
+        for (JsonObjectConst recentItem : recentArray) {
+            if (g_heardSummary.recent_count >= MAX_HEARD_RECENT_ITEMS) {
+                break;
+            }
+
+            HeardRecentItem& item = g_heardSummary.recent[g_heardSummary.recent_count++];
+            copyJsonString(recentItem["callsign"], item.callsign, sizeof(item.callsign));
+            copyJsonString(recentItem["name"], item.name, sizeof(item.name));
+            copyJsonString(recentItem["country_code"], item.country_code, sizeof(item.country_code));
+            copyJsonString(recentItem["last_seen"], item.last_seen, sizeof(item.last_seen));
+            copyJsonString(recentItem["last_tg"], item.last_tg, sizeof(item.last_tg));
+        }
+    }
+
+    g_heardSummary.valid = true;
+    printHeardSummary();
+}
+
 // Connection helpers
 
 void primeArp() {
@@ -413,6 +488,7 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
             const char* t = doc["type"] | "";
             if      (strcmp(t, "snapshot") == 0) parseSnapshot(doc);
             else if (strcmp(t, "live")     == 0) parseLive(doc);
+            else if (strcmp(t, "heard_summary") == 0) parseHeardSummary(doc);
             break;
         }
         default:
@@ -426,6 +502,7 @@ void setup() {
     Serial.begin(115200);
     clearSnapshotState();
     clearLiveState();
+    clearHeardSummaryState();
 
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("Connecting to WiFi");
