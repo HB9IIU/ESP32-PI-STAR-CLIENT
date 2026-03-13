@@ -173,6 +173,17 @@ bool liveEventHasDetailPayload() {
            g_live.rssi_count > 0;
 }
 
+bool isEmptyTalkerAliasEvent() {
+    return strcmp(g_live.last_event, "talker_alias") == 0 &&
+           g_live.talker_alias[0] == '\0' &&
+           g_live.source[0] == '\0' &&
+           g_live.destination[0] == '\0' &&
+           !g_live.duration_valid &&
+           !g_live.packet_loss_valid &&
+           !g_live.ber_valid &&
+           g_live.rssi_count == 0;
+}
+
 void printSnapshot(JsonVariantConst configVariant) {
     printDivider("PI-STAR SNAPSHOT");
     Serial.printf("Type              : %s\n", g_snapshot.type);
@@ -207,6 +218,14 @@ void printSnapshot(JsonVariantConst configVariant) {
 }
 
 void printLive() {
+    if (isEmptyTalkerAliasEvent()) {
+        Serial.printf("[LIVE] empty talker_alias #%d | slot=%d | raw=%s\n",
+            g_live.event_id,
+            g_live.slot_valid ? g_live.slot : -1,
+            g_live.raw_line[0] != '\0' ? g_live.raw_line : "n/a");
+        return;
+    }
+
     if (!liveEventHasDetailPayload()) {
         Serial.printf("[LIVE] sparse event #%d | %s | mode=%s | raw=%s\n",
             g_live.event_id,
