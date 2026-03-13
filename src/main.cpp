@@ -21,7 +21,7 @@ struct SnapshotState {
     int service_pid;
     char service_active_since[64];
     char config_mtime[32];
-    float config_mtime_ago_days;
+    int config_mtime_ago_hours;
     char current_log_file[96];
     char config_json[MAX_CONFIG_JSON_LENGTH];
     size_t config_json_length;
@@ -215,7 +215,7 @@ void printSnapshot(JsonVariantConst configVariant) {
     Serial.printf("Service PID       : %d\n", g_snapshot.service_pid);
     Serial.printf("Active Since      : %s\n", g_snapshot.service_active_since);
     Serial.printf("Config MTime      : %s\n", g_snapshot.config_mtime);
-    Serial.printf("Config Age Days   : %.2f\n", g_snapshot.config_mtime_ago_days);
+    Serial.printf("Config Age Hours  : %d\n", g_snapshot.config_mtime_ago_hours);
     Serial.printf("Current Log File  : %s\n", g_snapshot.current_log_file);
     Serial.printf("RadioID CSV File  : %s\n", g_snapshot.radioid_csv_file);
     Serial.printf("RadioID CSV Exists: %s\n", g_snapshot.radioid_csv_exists ? "yes" : "no");
@@ -355,7 +355,7 @@ void parseSnapshot(JsonDocument& doc) {
     g_snapshot.service_pid = doc["service"]["main_pid"] | 0;
     copyJsonString(doc["service"]["active_since"], g_snapshot.service_active_since, sizeof(g_snapshot.service_active_since));
     copyJsonString(doc["config_mtime"], g_snapshot.config_mtime, sizeof(g_snapshot.config_mtime));
-    g_snapshot.config_mtime_ago_days = doc["config_mtime_ago_days"] | 0.0f;
+    g_snapshot.config_mtime_ago_hours = doc["config_mtime_ago_hours"] | 0;
     copyJsonString(doc["current_log_file"], g_snapshot.current_log_file, sizeof(g_snapshot.current_log_file));
     storeConfigJson(doc["config"]);
     copyJsonString(doc["radioid_csv_file"], g_snapshot.radioid_csv_file, sizeof(g_snapshot.radioid_csv_file));

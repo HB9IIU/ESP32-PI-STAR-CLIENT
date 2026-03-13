@@ -60,7 +60,7 @@ SNAPSHOT_STATE = {
         "active_since": ""
     },
     "config_mtime": "",
-    "config_mtime_ago_days": 0.0,
+    "config_mtime_ago_hours": 0,
     "current_log_file": "",
     "config": {},
     "radioid_csv_file": RADIOID_LOCAL_CSV,
@@ -228,13 +228,6 @@ def format_timestamp_utc(timestamp_value):
     return datetime.fromtimestamp(timestamp_value, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def calculate_age_days(timestamp_value):
-    if not timestamp_value:
-        return 0.0
-    age_seconds = max(0.0, time.time() - timestamp_value)
-    return round(age_seconds / 86400.0, 2)
-
-
 def calculate_age_hours(timestamp_value):
     if not timestamp_value:
         return 0
@@ -364,9 +357,16 @@ def load_heard_callsigns_file():
             raise RuntimeError("heard callsigns file does not contain a JSON object")
 
         normalized_data = {}
+        removed_entries = 0
         for callsign, record in data.items():
             normalized_callsign = normalize_callsign(callsign)
             if not normalized_callsign or not isinstance(record, dict):
+                removed_entries += 1
+                continue
+
+            stored_callsign = record.get("callsign", normalized_callsign)
+            if not looks_like_real_callsign(stored_callsign):
+                removed_entries += 1
                 continue
 
             normalized_record = {
@@ -387,10 +387,12 @@ def load_heard_callsigns_file():
             normalized_data[normalized_callsign] = normalized_record
 
         HEARD_CALLSIGNS = normalized_data
-        HEARD_DB_DIRTY = False
-        HEARD_DB_PENDING_CHANGES = 0
+        HEARD_DB_DIRTY = removed_entries > 0
+        HEARD_DB_PENDING_CHANGES = removed_entries
         rebuild_heard_summary_state()
         print("Heard callsigns loaded: %d entries" % len(HEARD_CALLSIGNS))
+        if removed_entries > 0:
+            print("Heard callsigns cleanup removed %d invalid entries" % removed_entries)
     except Exception as exc:
         HEARD_CALLSIGNS = {}
         HEARD_DB_DIRTY = False
@@ -676,7 +678,7 @@ def rebuild_snapshot_state():
     SNAPSHOT_STATE["service"]["main_pid"] = get_service_main_pid()
     SNAPSHOT_STATE["service"]["active_since"] = get_service_active_since()
     SNAPSHOT_STATE["config_mtime"] = format_timestamp_utc(config_mtime)
-    SNAPSHOT_STATE["config_mtime_ago_days"] = calculate_age_days(config_mtime)
+    SNAPSHOT_STATE["config_mtime_ago_hours"] = calculate_age_hours(config_mtime)
     SNAPSHOT_STATE["current_log_file"] = find_latest_log_file()
     SNAPSHOT_STATE["config"] = parse_mmdvm_config_file()
     update_radioid_snapshot_metadata()
