@@ -8,8 +8,10 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
+import urllib.request
 from datetime import datetime, timezone
 
 import websockets
@@ -26,13 +28,18 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MMDVM_CONFIG_FILE = "/etc/mmdvmhost"
 MMDVM_LOG_GLOB = "/var/log/pi-star/MMDVM-*.log"
-LOOKUP_CSV_FILE = "/usr/local/etc/NXDN.csv"
 
 WS_BIND_HOST = "0.0.0.0"
 WS_BIND_PORT = 8765
 
 LOG_POLL_INTERVAL_SECONDS = 0.2
 RECHECK_INTERVAL_SECONDS = 2.0
+
+RADIOID_CSV_URL = "https://www.radioid.net/static/user.csv"
+RADIOID_LOCAL_CSV = os.path.join(APP_DIR, "radioid_user.csv")
+RADIOID_REFRESH_INTERVAL_SECONDS = 24 * 3600
+RADIOID_REFRESH_CHECK_INTERVAL_SECONDS = 300
+RADIOID_DOWNLOAD_TIMEOUT_SECONDS = 60
 
 # ---------------------------------------------------------------------
 # GLOBAL STATE
@@ -51,9 +58,9 @@ SNAPSHOT_STATE = {
     "config_mtime_ago_days": 0.0,
     "current_log_file": "",
     "config": {},
-    "lookup_csv_file": LOOKUP_CSV_FILE,
-    "lookup_csv_mtime": 0.0,
-    "lookup_entries": 0,
+    "radioid_csv_file": RADIOID_LOCAL_CSV,
+    "radioid_csv_mtime": 0.0,
+    "radioid_entries": 0,
     "station_callsign": "",
     "station_match_count": 0,
     "station_id": "",
@@ -238,17 +245,17 @@ COUNTRY_NAME_TO_ISO = {
 }
 
 # ---------------------------------------------------------------------
-# LOOKUP DATABASE
+# RADIOID DATABASE
 # ---------------------------------------------------------------------
 
-LOOKUP_BY_CALLSIGN = {}
+RADIOID_BY_CALLSIGN = {}
 
 
 def normalize_callsign(value):
     return str(value).strip().upper()
 
 
-def empty_lookup_record():
+def empty_radioid_record():
     return {
         "match_count": 0,
         "id": "",
@@ -262,14 +269,55 @@ def empty_lookup_record():
     }
 
 
-def load_lookup_csv(filepath):
-    global LOOKUP_BY_CALLSIGN
+def download_radioid_csv():
+    os.makedirs(APP_DIR, exist_ok=True)
+
+    temp_path = RADIOID_LOCAL_CSV + ".tmp"
+
+    request = urllib.request.Request(
+        RADIOID_CSV_URL,
+        headers={"User-Agent": "HB9IIU-MMDVM-LiveBridge/1.0"}
+    )
+
+    with urllib.request.urlopen(request, timeout=RADIOID_DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with open(temp_path, "wb") as f:
+            shutil.copyfileobj(response, f)
+
+    if not os.path.isfile(temp_path):
+        raise RuntimeError("temporary RadioID CSV file was not created")
+
+    if os.path.getsize(temp_path) <= 0:
+        raise RuntimeError("downloaded RadioID CSV is empty")
+
+    os.replace(temp_path, RADIOID_LOCAL_CSV)
+    print("RadioID CSV downloaded: %s" % RADIOID_LOCAL_CSV)
+
+
+def ensure_radioid_csv_present():
+    if os.path.isfile(RADIOID_LOCAL_CSV):
+        return
+    print("RadioID CSV not found, downloading...")
+    download_radioid_csv()
+
+
+def radioid_csv_is_stale():
+    if not os.path.isfile(RADIOID_LOCAL_CSV):
+        return True
+    age_seconds = time.time() - os.path.getmtime(RADIOID_LOCAL_CSV)
+    return age_seconds >= RADIOID_REFRESH_INTERVAL_SECONDS
+
+
+def load_radioid_csv(filepath):
+    global RADIOID_BY_CALLSIGN
 
     new_db = {}
     total_rows = 0
 
     with open(filepath, "r", encoding="utf-8", errors="replace", newline="") as f:
         reader = csv.reader(f)
+
+        # Skip header row
+        next(reader, None)
 
         for row in reader:
             total_rows += 1
@@ -305,15 +353,15 @@ def load_lookup_csv(filepath):
             else:
                 new_db[callsign]["match_count"] += 1
 
-    LOOKUP_BY_CALLSIGN = new_db
-    SNAPSHOT_STATE["lookup_entries"] = len(LOOKUP_BY_CALLSIGN)
-    SNAPSHOT_STATE["lookup_csv_mtime"] = get_file_mtime(filepath)
+    RADIOID_BY_CALLSIGN = new_db
+    SNAPSHOT_STATE["radioid_entries"] = len(RADIOID_BY_CALLSIGN)
+    SNAPSHOT_STATE["radioid_csv_mtime"] = get_file_mtime(filepath)
 
-    print("Lookup DB loaded: %d callsigns from %d CSV rows" % (len(LOOKUP_BY_CALLSIGN), total_rows))
+    print("RadioID DB loaded: %d callsigns from %d CSV rows" % (len(RADIOID_BY_CALLSIGN), total_rows))
 
 
 def lookup_callsign(callsign):
-    return LOOKUP_BY_CALLSIGN.get(normalize_callsign(callsign), empty_lookup_record())
+    return RADIOID_BY_CALLSIGN.get(normalize_callsign(callsign), empty_radioid_record())
 
 # ---------------------------------------------------------------------
 # CONFIG PARSING
@@ -355,8 +403,8 @@ def rebuild_snapshot_state():
     SNAPSHOT_STATE["config_mtime_ago_days"] = calculate_age_days(config_mtime)
     SNAPSHOT_STATE["current_log_file"] = find_latest_log_file()
     SNAPSHOT_STATE["config"] = parse_mmdvm_config_file()
-    SNAPSHOT_STATE["lookup_csv_file"] = LOOKUP_CSV_FILE
-    SNAPSHOT_STATE["lookup_csv_mtime"] = get_file_mtime(LOOKUP_CSV_FILE)
+    SNAPSHOT_STATE["radioid_csv_file"] = RADIOID_LOCAL_CSV
+    SNAPSHOT_STATE["radioid_csv_mtime"] = get_file_mtime(RADIOID_LOCAL_CSV)
 
     station_callsign = SNAPSHOT_STATE["config"].get("General", {}).get("Callsign", "")
     station_info = lookup_callsign(station_callsign)
@@ -611,13 +659,34 @@ async def ws_handler(websocket):
         print("CLIENT DISCONNECTED")
 
 # ---------------------------------------------------------------------
+# BACKGROUND RADIOID REFRESH
+# ---------------------------------------------------------------------
+
+async def radioid_refresh_loop():
+    while True:
+        try:
+            if radioid_csv_is_stale():
+                print("RadioID CSV is stale, refreshing...")
+                download_radioid_csv()
+                load_radioid_csv(RADIOID_LOCAL_CSV)
+                rebuild_snapshot_state()
+                await broadcast_snapshot_state()
+        except Exception as e:
+            print("Warning: RadioID refresh failed: %s" % e)
+
+        await asyncio.sleep(RADIOID_REFRESH_CHECK_INTERVAL_SECONDS)
+
+# ---------------------------------------------------------------------
 # LOG MONITOR
 # ---------------------------------------------------------------------
 
 async def monitor_log_forever():
-    load_lookup_csv(LOOKUP_CSV_FILE)
     rebuild_snapshot_state()
     reset_live_state()
+
+    ensure_radioid_csv_present()
+    load_radioid_csv(RADIOID_LOCAL_CSV)
+    rebuild_snapshot_state()
 
     current_log_file = SNAPSHOT_STATE["current_log_file"]
     if not current_log_file:
@@ -626,7 +695,6 @@ async def monitor_log_forever():
     log_handle = open_log_file_at_end(current_log_file)
 
     last_config_file_mtime, last_service_main_pid, last_log_file = get_watch_state_tuple()
-    last_lookup_csv_mtime = get_file_mtime(LOOKUP_CSV_FILE)
     last_recheck_time = time.monotonic()
 
     while True:
@@ -646,17 +714,12 @@ async def monitor_log_forever():
         last_recheck_time = now_monotonic
 
         current_config_file_mtime, current_service_main_pid, current_log_file = get_watch_state_tuple()
-        current_lookup_csv_mtime = get_file_mtime(LOOKUP_CSV_FILE)
 
         config_changed = current_config_file_mtime != last_config_file_mtime
         pid_changed = current_service_main_pid != last_service_main_pid
         logfile_changed = current_log_file != last_log_file
-        lookup_changed = current_lookup_csv_mtime != last_lookup_csv_mtime
 
-        if lookup_changed:
-            load_lookup_csv(LOOKUP_CSV_FILE)
-
-        if config_changed or pid_changed or logfile_changed or lookup_changed:
+        if config_changed or pid_changed or logfile_changed:
             print("CHANGE DETECTED")
 
             try:
@@ -676,23 +739,34 @@ async def monitor_log_forever():
             last_config_file_mtime = current_config_file_mtime
             last_service_main_pid = current_service_main_pid
             last_log_file = current_log_file
-            last_lookup_csv_mtime = current_lookup_csv_mtime
 
 # ---------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------
 
 async def main():
-    load_lookup_csv(LOOKUP_CSV_FILE)
     rebuild_snapshot_state()
     reset_live_state()
 
+    ensure_radioid_csv_present()
+    load_radioid_csv(RADIOID_LOCAL_CSV)
+    rebuild_snapshot_state()
+
     print("WebSocket server running on port %d" % WS_BIND_PORT)
     print("Current log file: %s" % SNAPSHOT_STATE["current_log_file"])
-    print("Lookup CSV file: %s" % LOOKUP_CSV_FILE)
+    print("RadioID CSV file: %s" % RADIOID_LOCAL_CSV)
 
-    async with websockets.serve(ws_handler, WS_BIND_HOST, WS_BIND_PORT):
-        await monitor_log_forever()
+    refresh_task = asyncio.create_task(radioid_refresh_loop())
+
+    try:
+        async with websockets.serve(ws_handler, WS_BIND_HOST, WS_BIND_PORT):
+            await monitor_log_forever()
+    finally:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
