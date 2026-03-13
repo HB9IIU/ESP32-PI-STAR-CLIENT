@@ -29,7 +29,7 @@ struct SnapshotState {
     char radioid_csv_file[128];
     bool radioid_csv_exists;
     char radioid_csv_mtime[32];
-    float radioid_csv_age_days;
+    int radioid_csv_age_hours;
     bool radioid_csv_is_stale;
     int radioid_entries;
     bool radioid_lookup_loaded;
@@ -185,7 +185,7 @@ void printSnapshot(JsonVariantConst configVariant) {
     Serial.printf("RadioID CSV File  : %s\n", g_snapshot.radioid_csv_file);
     Serial.printf("RadioID CSV Exists: %s\n", g_snapshot.radioid_csv_exists ? "yes" : "no");
     Serial.printf("RadioID CSV MTime : %s\n", g_snapshot.radioid_csv_mtime);
-    Serial.printf("RadioID CSV Age   : %.2f days\n", g_snapshot.radioid_csv_age_days);
+    Serial.printf("RadioID CSV Age   : %d hours\n", g_snapshot.radioid_csv_age_hours);
     Serial.printf("RadioID CSV Stale : %s\n", g_snapshot.radioid_csv_is_stale ? "yes" : "no");
     Serial.printf("RadioID Entries   : %d\n", g_snapshot.radioid_entries);
     Serial.printf("RadioID Loaded    : %s\n", g_snapshot.radioid_lookup_loaded ? "yes" : "no");
@@ -296,7 +296,7 @@ void parseSnapshot(JsonDocument& doc) {
     copyJsonString(doc["radioid_csv_file"], g_snapshot.radioid_csv_file, sizeof(g_snapshot.radioid_csv_file));
     g_snapshot.radioid_csv_exists = doc["radioid_csv_exists"] | false;
     copyJsonString(doc["radioid_csv_mtime"], g_snapshot.radioid_csv_mtime, sizeof(g_snapshot.radioid_csv_mtime));
-    g_snapshot.radioid_csv_age_days = doc["radioid_csv_age_days"] | 0.0f;
+    g_snapshot.radioid_csv_age_hours = doc["radioid_csv_age_hours"] | 0;
     g_snapshot.radioid_csv_is_stale = doc["radioid_csv_is_stale"] | true;
     g_snapshot.radioid_entries = doc["radioid_entries"] | 0;
     g_snapshot.radioid_lookup_loaded = doc["radioid_lookup_loaded"] | false;

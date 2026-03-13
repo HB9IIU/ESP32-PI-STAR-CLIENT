@@ -61,7 +61,7 @@ SNAPSHOT_STATE = {
     "radioid_csv_file": RADIOID_LOCAL_CSV,
     "radioid_csv_exists": False,
     "radioid_csv_mtime": "",
-    "radioid_csv_age_days": 0.0,
+    "radioid_csv_age_hours": 0,
     "radioid_csv_is_stale": True,
     "radioid_entries": 0,
     "radioid_lookup_loaded": False,
@@ -221,6 +221,13 @@ def calculate_age_days(timestamp_value):
     age_seconds = max(0.0, time.time() - timestamp_value)
     return round(age_seconds / 86400.0, 2)
 
+
+def calculate_age_hours(timestamp_value):
+    if not timestamp_value:
+        return 0
+    age_seconds = max(0.0, time.time() - timestamp_value)
+    return int(age_seconds // 3600)
+
 # ---------------------------------------------------------------------
 # COUNTRY LOOKUP
 # ---------------------------------------------------------------------
@@ -298,7 +305,7 @@ def update_radioid_snapshot_metadata():
     SNAPSHOT_STATE["radioid_csv_file"] = RADIOID_LOCAL_CSV
     SNAPSHOT_STATE["radioid_csv_exists"] = radioid_csv_exists
     SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
-    SNAPSHOT_STATE["radioid_csv_age_days"] = calculate_age_days(radioid_csv_mtime)
+    SNAPSHOT_STATE["radioid_csv_age_hours"] = calculate_age_hours(radioid_csv_mtime)
     SNAPSHOT_STATE["radioid_csv_is_stale"] = radioid_csv_is_stale() if radioid_csv_exists else True
     SNAPSHOT_STATE["radioid_lookup_loaded"] = RADIOID_LOOKUP_LOADED
     SNAPSHOT_STATE["radioid_status"] = get_radioid_status()
