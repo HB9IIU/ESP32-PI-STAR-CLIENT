@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+from datetime import datetime, timezone
 
 import websockets
 
@@ -53,7 +54,8 @@ SNAPSHOT_STATE = {
         "main_pid": 0,
         "active_since": ""
     },
-    "config_mtime": 0.0,
+    "config_mtime": "",
+    "config_mtime_ago_days": 0.0,
     "current_log_file": "",
     "config": {},
     "radioid_csv_file": RADIOID_LOCAL_CSV,
@@ -197,6 +199,19 @@ def get_file_mtime(path):
         return os.path.getmtime(path)
     except OSError:
         return 0.0
+
+
+def format_timestamp_utc(timestamp_value):
+    if not timestamp_value:
+        return ""
+    return datetime.fromtimestamp(timestamp_value, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def calculate_age_days(timestamp_value):
+    if not timestamp_value:
+        return 0.0
+    age_seconds = max(0.0, time.time() - timestamp_value)
+    return round(age_seconds / 86400.0, 2)
 
 # ---------------------------------------------------------------------
 # COUNTRY LOOKUP
@@ -379,10 +394,13 @@ def parse_mmdvm_config_file():
 
 
 def rebuild_snapshot_state():
+    config_mtime = get_config_file_mtime()
+
     SNAPSHOT_STATE["service"]["state"] = get_service_state()
     SNAPSHOT_STATE["service"]["main_pid"] = get_service_main_pid()
     SNAPSHOT_STATE["service"]["active_since"] = get_service_active_since()
-    SNAPSHOT_STATE["config_mtime"] = get_config_file_mtime()
+    SNAPSHOT_STATE["config_mtime"] = format_timestamp_utc(config_mtime)
+    SNAPSHOT_STATE["config_mtime_ago_days"] = calculate_age_days(config_mtime)
     SNAPSHOT_STATE["current_log_file"] = find_latest_log_file()
     SNAPSHOT_STATE["config"] = parse_mmdvm_config_file()
     SNAPSHOT_STATE["radioid_csv_file"] = RADIOID_LOCAL_CSV
