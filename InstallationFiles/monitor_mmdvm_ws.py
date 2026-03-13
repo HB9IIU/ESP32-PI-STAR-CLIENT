@@ -59,7 +59,7 @@ SNAPSHOT_STATE = {
     "current_log_file": "",
     "config": {},
     "radioid_csv_file": RADIOID_LOCAL_CSV,
-    "radioid_csv_mtime": 0.0,
+    "radioid_csv_mtime": "",
     "radioid_entries": 0,
     "station_callsign": "",
     "station_match_count": 0,
@@ -353,9 +353,11 @@ def load_radioid_csv(filepath):
             else:
                 new_db[callsign]["match_count"] += 1
 
+    radioid_csv_mtime = get_file_mtime(filepath)
+
     RADIOID_BY_CALLSIGN = new_db
     SNAPSHOT_STATE["radioid_entries"] = len(RADIOID_BY_CALLSIGN)
-    SNAPSHOT_STATE["radioid_csv_mtime"] = get_file_mtime(filepath)
+    SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
 
     print("RadioID DB loaded: %d callsigns from %d CSV rows" % (len(RADIOID_BY_CALLSIGN), total_rows))
 
@@ -403,8 +405,10 @@ def rebuild_snapshot_state():
     SNAPSHOT_STATE["config_mtime_ago_days"] = calculate_age_days(config_mtime)
     SNAPSHOT_STATE["current_log_file"] = find_latest_log_file()
     SNAPSHOT_STATE["config"] = parse_mmdvm_config_file()
+    radioid_csv_mtime = get_file_mtime(RADIOID_LOCAL_CSV)
+
     SNAPSHOT_STATE["radioid_csv_file"] = RADIOID_LOCAL_CSV
-    SNAPSHOT_STATE["radioid_csv_mtime"] = get_file_mtime(RADIOID_LOCAL_CSV)
+    SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
 
     station_callsign = SNAPSHOT_STATE["config"].get("General", {}).get("Callsign", "")
     station_info = lookup_callsign(station_callsign)
