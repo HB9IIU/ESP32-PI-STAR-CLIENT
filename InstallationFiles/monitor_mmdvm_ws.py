@@ -59,8 +59,16 @@ SNAPSHOT_STATE = {
     "current_log_file": "",
     "config": {},
     "radioid_csv_file": RADIOID_LOCAL_CSV,
+    "radioid_csv_exists": False,
     "radioid_csv_mtime": "",
+    "radioid_csv_age_days": 0.0,
+    "radioid_csv_is_stale": True,
     "radioid_entries": 0,
+    "radioid_lookup_loaded": False,
+    "radioid_status": "uninitialized",
+    "radioid_last_refresh_attempt": "",
+    "radioid_last_refresh_success": "",
+    "radioid_last_refresh_error": "",
     "station_callsign": "",
     "station_match_count": 0,
     "station_id": "",
@@ -249,6 +257,10 @@ COUNTRY_NAME_TO_ISO = {
 # ---------------------------------------------------------------------
 
 RADIOID_BY_CALLSIGN = {}
+RADIOID_LOOKUP_LOADED = False
+RADIOID_LAST_REFRESH_ATTEMPT_TS = 0.0
+RADIOID_LAST_REFRESH_SUCCESS_TS = 0.0
+RADIOID_LAST_REFRESH_ERROR = ""
 
 
 def normalize_callsign(value):
@@ -267,6 +279,32 @@ def empty_radioid_record():
         "country": "",
         "country_code": ""
     }
+
+
+def get_radioid_status():
+    if not os.path.isfile(RADIOID_LOCAL_CSV):
+        return "missing"
+    if not RADIOID_LOOKUP_LOADED:
+        return "not_loaded"
+    if radioid_csv_is_stale():
+        return "stale"
+    return "ready"
+
+
+def update_radioid_snapshot_metadata():
+    radioid_csv_exists = os.path.isfile(RADIOID_LOCAL_CSV)
+    radioid_csv_mtime = get_file_mtime(RADIOID_LOCAL_CSV)
+
+    SNAPSHOT_STATE["radioid_csv_file"] = RADIOID_LOCAL_CSV
+    SNAPSHOT_STATE["radioid_csv_exists"] = radioid_csv_exists
+    SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
+    SNAPSHOT_STATE["radioid_csv_age_days"] = calculate_age_days(radioid_csv_mtime)
+    SNAPSHOT_STATE["radioid_csv_is_stale"] = radioid_csv_is_stale() if radioid_csv_exists else True
+    SNAPSHOT_STATE["radioid_lookup_loaded"] = RADIOID_LOOKUP_LOADED
+    SNAPSHOT_STATE["radioid_status"] = get_radioid_status()
+    SNAPSHOT_STATE["radioid_last_refresh_attempt"] = format_timestamp_utc(RADIOID_LAST_REFRESH_ATTEMPT_TS)
+    SNAPSHOT_STATE["radioid_last_refresh_success"] = format_timestamp_utc(RADIOID_LAST_REFRESH_SUCCESS_TS)
+    SNAPSHOT_STATE["radioid_last_refresh_error"] = RADIOID_LAST_REFRESH_ERROR
 
 
 def download_radioid_csv():
@@ -309,6 +347,7 @@ def radioid_csv_is_stale():
 
 def load_radioid_csv(filepath):
     global RADIOID_BY_CALLSIGN
+    global RADIOID_LOOKUP_LOADED
 
     new_db = {}
     total_rows = 0
@@ -353,13 +392,43 @@ def load_radioid_csv(filepath):
             else:
                 new_db[callsign]["match_count"] += 1
 
-    radioid_csv_mtime = get_file_mtime(filepath)
-
     RADIOID_BY_CALLSIGN = new_db
+    RADIOID_LOOKUP_LOADED = True
     SNAPSHOT_STATE["radioid_entries"] = len(RADIOID_BY_CALLSIGN)
-    SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
+    update_radioid_snapshot_metadata()
 
     print("RadioID DB loaded: %d callsigns from %d CSV rows" % (len(RADIOID_BY_CALLSIGN), total_rows))
+
+
+def refresh_radioid_database(download_if_needed):
+    global RADIOID_LAST_REFRESH_ATTEMPT_TS
+    global RADIOID_LAST_REFRESH_SUCCESS_TS
+    global RADIOID_LAST_REFRESH_ERROR
+    global RADIOID_LOOKUP_LOADED
+
+    RADIOID_LAST_REFRESH_ATTEMPT_TS = time.time()
+    RADIOID_LAST_REFRESH_ERROR = ""
+
+    try:
+        needs_download = not os.path.isfile(RADIOID_LOCAL_CSV)
+        if download_if_needed and (needs_download or radioid_csv_is_stale()):
+            if needs_download:
+                print("RadioID CSV not found, downloading...")
+            else:
+                print("RadioID CSV is stale, refreshing...")
+            download_radioid_csv()
+        elif needs_download:
+            raise RuntimeError("RadioID CSV file is missing")
+
+        load_radioid_csv(RADIOID_LOCAL_CSV)
+        RADIOID_LAST_REFRESH_SUCCESS_TS = time.time()
+        update_radioid_snapshot_metadata()
+    except Exception as exc:
+        RADIOID_LOOKUP_LOADED = False
+        SNAPSHOT_STATE["radioid_entries"] = 0
+        RADIOID_LAST_REFRESH_ERROR = str(exc)
+        update_radioid_snapshot_metadata()
+        raise
 
 
 def lookup_callsign(callsign):
@@ -405,10 +474,7 @@ def rebuild_snapshot_state():
     SNAPSHOT_STATE["config_mtime_ago_days"] = calculate_age_days(config_mtime)
     SNAPSHOT_STATE["current_log_file"] = find_latest_log_file()
     SNAPSHOT_STATE["config"] = parse_mmdvm_config_file()
-    radioid_csv_mtime = get_file_mtime(RADIOID_LOCAL_CSV)
-
-    SNAPSHOT_STATE["radioid_csv_file"] = RADIOID_LOCAL_CSV
-    SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
+    update_radioid_snapshot_metadata()
 
     station_callsign = SNAPSHOT_STATE["config"].get("General", {}).get("Callsign", "")
     station_info = lookup_callsign(station_callsign)
@@ -670,13 +736,13 @@ async def radioid_refresh_loop():
     while True:
         try:
             if radioid_csv_is_stale():
-                print("RadioID CSV is stale, refreshing...")
-                download_radioid_csv()
-                load_radioid_csv(RADIOID_LOCAL_CSV)
+                refresh_radioid_database(download_if_needed=True)
                 rebuild_snapshot_state()
                 await broadcast_snapshot_state()
         except Exception as e:
             print("Warning: RadioID refresh failed: %s" % e)
+            rebuild_snapshot_state()
+            await broadcast_snapshot_state()
 
         await asyncio.sleep(RADIOID_REFRESH_CHECK_INTERVAL_SECONDS)
 
@@ -688,8 +754,7 @@ async def monitor_log_forever():
     rebuild_snapshot_state()
     reset_live_state()
 
-    ensure_radioid_csv_present()
-    load_radioid_csv(RADIOID_LOCAL_CSV)
+    refresh_radioid_database(download_if_needed=True)
     rebuild_snapshot_state()
 
     current_log_file = SNAPSHOT_STATE["current_log_file"]
@@ -752,8 +817,7 @@ async def main():
     rebuild_snapshot_state()
     reset_live_state()
 
-    ensure_radioid_csv_present()
-    load_radioid_csv(RADIOID_LOCAL_CSV)
+    refresh_radioid_database(download_if_needed=True)
     rebuild_snapshot_state()
 
     print("WebSocket server running on port %d" % WS_BIND_PORT)
