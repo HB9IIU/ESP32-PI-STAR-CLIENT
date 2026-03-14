@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <SPIFFS.h>
 
 #define WIFI_SSID  "NO WIFI FOR YOU!!!"
 #define WIFI_PASS  "Nestle2010Nestle"
@@ -460,11 +461,24 @@ void parseHeardSummary(JsonDocument& doc) {
 
 // Connection helpers
 
-void primeArp() {
+bool primeArp(uint8_t maxAttempts = 3) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WS] ARP prime skipped: WiFi not connected");
+        return false;
+    }
+
     WiFiClient tcp;
-    while (!tcp.connect(WS_HOST, WS_PORT)) { delay(500); }
-    tcp.stop();
-    delay(100);
+    for (uint8_t attempt = 1; attempt <= maxAttempts; ++attempt) {
+        if (tcp.connect(WS_HOST, WS_PORT)) {
+            tcp.stop();
+            delay(100);
+            return true;
+        }
+        delay(250);
+    }
+
+    Serial.println("[WS] ARP prime skipped: host not reachable yet");
+    return false;
 }
 
 // WebSocket
@@ -473,7 +487,6 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
         case WStype_DISCONNECTED:
             Serial.println("[WS] Disconnected");
-            primeArp();
             break;
         case WStype_CONNECTED:
             Serial.println("[WS] Connected");
@@ -496,10 +509,502 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
     }
 }
 
+
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
+#include <XPT2046_Touchscreen.h>
+
+#include "RobotoCondensedBold24px7b.h"
+#include "RobotoCondensedBold36px7b.h"
+#include "RobotoCondensedBold12px7b.h"
+#include "RobotoMonoRegular10px7b.h"
+#include "RobotoMonoRegular12px7b.h"
+#include "RobotoMonoRegular20px7b.h"
+#include "RobotoCondensedRegular16px7b.h"
+#include "UbuntuMonoBold18px7b.h"
+
+TFT_eSPI tft = TFT_eSPI();
+
+SPIClass touchscreenSPI = SPIClass(VSPI);
+XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
+
+#define FONT_SIZE 2
+
+constexpr uint32_t COUNTRY_MAP_DEMO_INTERVAL_MS = 4000;
+constexpr int LEFT_COLUMN_SEPARATOR_WIDTH = 222;
+
+const char* kDemoCountryCodes[] = {"CH", "DE", "FR", "GB", "JP", "US"};
+constexpr size_t kDemoCountryCodeCount = sizeof(kDemoCountryCodes) / sizeof(kDemoCountryCodes[0]);
+const char* kSmallFlagRowDemoCountryCodes[] = {"AU", "BE", "BR", "CA", "CH", "DE", "DK", "ES", "FR", "GB", "IT", "JP", "NL", "SE", "US"};
+constexpr size_t kSmallFlagRowDemoCountryCodeCount = sizeof(kSmallFlagRowDemoCountryCodes) / sizeof(kSmallFlagRowDemoCountryCodes[0]);
+
+size_t g_demoCountryIndex = 0;
+unsigned long g_nextCountryMapDemoMs = 0;
+
+bool tftJpegOutput(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t* bitmap) {
+    if (y >= tft.height() || x >= tft.width()) {
+        return false;
+    }
+
+    if (x + width > tft.width()) {
+        width = tft.width() - x;
+    }
+
+    if (y + height > tft.height()) {
+        height = tft.height() - y;
+    }
+
+    tft.pushImage(x, y, width, height, bitmap);
+    return true;
+}
+
+bool looksLikeCountryCode(const char* countryCode) {
+    return countryCode != nullptr &&
+                 strlen(countryCode) == 2 &&
+                 isAlpha(countryCode[0]) &&
+                 isAlpha(countryCode[1]);
+}
+
+void buildCountryAssetPath(const char* countryCode, const char* sizeFolder, char* path, size_t pathSize) {
+    char normalizedCode[3] = {'\0', '\0', '\0'};
+    normalizedCode[0] = static_cast<char>(toupper(countryCode[0]));
+    normalizedCode[1] = static_cast<char>(toupper(countryCode[1]));
+
+    snprintf(path, pathSize, "/flags/%s/%s.jpg", sizeFolder, normalizedCode);
+}
+
+bool displayCountryMapFromFolder(const char* countryCode, const char* sizeFolder, int x, int y) {
+    if (!looksLikeCountryCode(countryCode)) {
+        Serial.printf("[TFT] Invalid country code: %s\n", countryCode != nullptr ? countryCode : "<null>");
+        return false;
+    }
+
+    char assetPath[32];
+    buildCountryAssetPath(countryCode, sizeFolder, assetPath, sizeof(assetPath));
+
+    if (!SPIFFS.exists(assetPath)) {
+        Serial.printf("[TFT] Missing asset: %s\n", assetPath);
+        tft.drawRect(x, y, 48, 32, TFT_RED);
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.drawString(countryCode, x + 4, y + 8, FONT_SIZE);
+        return false;
+    }
+
+    Serial.printf("[TFT] Drawing %s at (%d,%d)\n", assetPath, x, y);
+    return TJpgDec.drawFsJpg(x, y, assetPath, SPIFFS);
+}
+
+bool displayContryMapLarge(const char* countryCode, int x, int y) {
+    return displayCountryMapFromFolder(countryCode, "large", x, y);
+}
+
+bool displayContryMapSmall(const char* countryCode, int x, int y) {
+    return displayCountryMapFromFolder(countryCode, "small", x, y);
+}
+
+const char* currentDemoCountryCode() {
+    if (looksLikeCountryCode(g_live.source_country_code)) {
+        return g_live.source_country_code;
+    }
+
+    if (looksLikeCountryCode(g_snapshot.station_country_code)) {
+        return g_snapshot.station_country_code;
+    }
+
+    return kDemoCountryCodes[g_demoCountryIndex];
+}
+
+void drawTopCallsignFontDemo(const char* callsign) {
+    const char* text = (callsign != nullptr && callsign[0] != '\0') ? callsign : "HB9IIU";
+
+    tft.fillRect(0, 0, tft.width(), 32, TFT_NAVY);
+    tft.drawFastHLine(0, 31, tft.width(), TFT_CYAN);
+
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setFreeFont(&UbuntuMonoBold18px7b);
+    tft.drawString(text, tft.width() / 2, 5);
+
+    tft.setFreeFont(nullptr);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawFlagAndCallsignDemo(const char* countryCode, const char* callsign) {
+    const char* code = looksLikeCountryCode(countryCode) ? countryCode : "US";
+    const char* text = (callsign != nullptr && callsign[0] != '\0') ? callsign : "KC9WX";
+
+    const int y = 50;
+    const int height = 58;
+    const int flagX = 10;
+    const int flagY = 56;
+    const int textX = 72;
+    const int textY = 52;
+    const int separatorY = 103;
+
+    tft.fillRect(0, y, tft.width(), height, TFT_BLACK);
+    displayContryMapLarge(code, flagX, flagY);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setFreeFont(&RobotoCondensedBold36px7b);
+    tft.drawString(text, textX, textY);
+    tft.drawFastHLine(0, separatorY, tft.width(), TFT_CYAN);
+
+    tft.setFreeFont(nullptr);
+}
+
+void drawNameFontDemo(const char* name) {
+    const char* text = (name != nullptr && name[0] != '\0') ? name : "PAUL";
+    const uint16_t gold = tft.color565(245, 200, 60);
+
+    const int x = 10;
+    const int y = 109;
+    const int width = tft.width() - x;
+    const int height = 34;
+
+    tft.fillRect(x, y, width, height, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(gold, TFT_BLACK);
+    tft.setFreeFont(&RobotoCondensedBold24px7b);
+    tft.drawString(text, x, y);
+
+    tft.setFreeFont(nullptr);
+}
+
+void drawLocationFontDemo(const char* location) {
+    const char* text = (location != nullptr && location[0] != '\0') ? location : "KOKOMO, UNITED STATES";
+    const uint16_t textColor = tft.color565(232, 232, 232);
+
+    const int x = 10;
+    const int dividerY = 144;
+    const int y = 150;
+    const int width = tft.width() - x;
+    const int height = 24;
+
+    tft.fillRect(x, y, width, height, TFT_BLACK);
+    tft.drawFastHLine(0, dividerY, tft.width(), TFT_CYAN);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(textColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoCondensedRegular16px7b);
+    tft.drawString(text, x, y);
+
+    tft.setFreeFont(nullptr);
+}
+
+void drawTalkgroupRowDemo(const char* label) {
+    const char* text = (label != nullptr && label[0] != '\0') ? label : "TS2 WORLD WIDE";
+    const uint16_t textColor = tft.color565(215, 235, 245);
+
+    const int x = 10;
+    const int dividerY = 171;
+    const int y = 175;
+    const int width = tft.width() - x;
+    const int height = 28;
+    const int bottomSeparatorY = 197;
+
+    tft.fillRect(x, y, width, height, TFT_BLACK);
+    tft.drawFastHLine(0, dividerY, tft.width(), TFT_CYAN);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(textColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoCondensedRegular16px7b);
+    tft.drawString(text, x, y);
+    tft.drawFastHLine(0, bottomSeparatorY, tft.width(), TFT_CYAN);
+
+    tft.setFreeFont(nullptr);
+}
+
+void drawActivityStatusBannerDemo(const char* statusText) {
+    const char* text = (statusText != nullptr && statusText[0] != '\0') ? statusText : "RX";
+    const bool isTx = strcmp(text, "TX") == 0;
+    const uint16_t fillColor = isTx ? tft.color565(210, 45, 45) : tft.color565(35, 145, 60);
+
+    const int x = 10;
+    const int y = 36;
+    const int bodyWidth = 116;
+    const int arrowWidth = 12;
+    const int height = 14;
+    const int midY = y + (height / 2);
+
+    tft.fillRect(x - 1, y - 1, bodyWidth + arrowWidth + 2, height + 2, TFT_BLACK);
+    tft.fillRect(x, y, bodyWidth, height, fillColor);
+    tft.fillTriangle(x + bodyWidth, y,
+                     x + bodyWidth + arrowWidth, midY,
+                     x + bodyWidth, y + height,
+                     fillColor);
+
+    tft.setTextDatum(CC_DATUM);
+    tft.setTextColor(TFT_WHITE, fillColor);
+    tft.setFreeFont(&RobotoCondensedBold12px7b);
+    tft.drawString(text, x + (bodyWidth / 2), y + (height / 2));
+
+    tft.setFreeFont(nullptr);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawClockDemo(const char* timeText) {
+    const char* text = (timeText != nullptr && timeText[0] != '\0') ? timeText : "19:45";
+    const uint16_t textColor = TFT_WHITE;
+    const uint16_t backgroundColor = TFT_NAVY;
+
+    const int rightMargin = 8;
+    const int y = 7;
+    const int width = 86;
+    const int height = 14;
+    const int x = tft.width() - rightMargin - width;
+
+    tft.fillRect(x, y, width, height, backgroundColor);
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(textColor, backgroundColor);
+    tft.setFreeFont(&RobotoMonoRegular12px7b);
+    tft.drawString(text, tft.width() - rightMargin, y);
+
+    tft.setFreeFont(nullptr);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawRssiMetricDemo(const char* valueText) {
+    const char* text = (valueText != nullptr && valueText[0] != '\0') ? valueText : "-73";
+    const uint16_t labelColor = tft.color565(165, 205, 220);
+    const uint16_t valueColor = TFT_WHITE;
+    const int x = 246;
+    const int x1 = 316;
+    const int y = 39;
+
+    tft.fillRect(x, y, 88, 14, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(labelColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoCondensedBold12px7b);
+    tft.drawString("RSSI", x, y);
+    tft.setTextColor(valueColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoMonoRegular12px7b);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(text, x1, y);
+    tft.setFreeFont(nullptr);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawBerMetricDemo(const char* valueText) {
+    const char* text = (valueText != nullptr && valueText[0] != '\0') ? valueText : "xx";
+    const uint16_t labelColor = tft.color565(165, 205, 220);
+    const uint16_t valueColor = TFT_WHITE;
+    const int x = 246;
+    const int x1 = 316;
+    const int y = 61;
+
+    tft.fillRect(x, y, 88, 14, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(labelColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoCondensedBold12px7b);
+    tft.drawString("BER", x, y);
+    tft.setTextColor(valueColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoMonoRegular12px7b);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(text, x1, y);
+    tft.setFreeFont(nullptr);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawLossMetricDemo(const char* valueText) {
+    const char* text = (valueText != nullptr && valueText[0] != '\0') ? valueText : "yy";
+    const uint16_t labelColor = tft.color565(165, 205, 220);
+    const uint16_t valueColor = TFT_WHITE;
+    const int x = 246;
+    const int x1 = 316;
+    const int y = 83;
+
+    tft.fillRect(x, y, 88, 14, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(labelColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoCondensedBold12px7b);
+    tft.drawString("LOSS", x, y);
+    tft.setTextColor(valueColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoMonoRegular12px7b);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(text, x1, y);
+    tft.setFreeFont(nullptr);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawDurationMetricDemo(const char* valueText) {
+    const char* text = (valueText != nullptr && valueText[0] != '\0') ? valueText : "0:42";
+    const uint16_t valueColor = TFT_WHITE;
+    const int x1 = 316;
+    const int y = 108;
+    const int iconX = x1 - 100;
+
+    tft.fillRect(200, y, 120, 28, TFT_BLACK);
+    if (SPIFFS.exists("/timer.jpg")) {
+        TJpgDec.drawFsJpg(iconX, y + 1, "/timer.jpg", SPIFFS);
+    }
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(valueColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoMonoRegular20px7b);
+    tft.drawString(text, x1, y);
+    tft.setFreeFont(nullptr);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawRecentHeardFlagsDemo() {
+    constexpr size_t kVisibleFlagCount = 8;
+    constexpr int kFlagWidth = 24;
+    constexpr int kFlagHeight = 17;
+
+    const int startX = 17;
+    const int stepX = 37;
+    const int y = 206;
+    const int rowWidth = (static_cast<int>(kVisibleFlagCount) - 1) * stepX + kFlagWidth;
+
+    size_t shuffledIndices[kSmallFlagRowDemoCountryCodeCount];
+    for (size_t index = 0; index < kSmallFlagRowDemoCountryCodeCount; ++index) {
+        shuffledIndices[index] = index;
+    }
+
+    for (size_t index = kSmallFlagRowDemoCountryCodeCount - 1; index > 0; --index) {
+        const size_t swapIndex = static_cast<size_t>(random(static_cast<long>(index + 1)));
+        const size_t temp = shuffledIndices[index];
+        shuffledIndices[index] = shuffledIndices[swapIndex];
+        shuffledIndices[swapIndex] = temp;
+    }
+
+    tft.fillRect(startX, y, rowWidth, kFlagHeight, TFT_BLACK);
+
+    for (size_t index = 0; index < kVisibleFlagCount; ++index) {
+        const int x = startX + static_cast<int>(index) * stepX;
+        const char* countryCode = kSmallFlagRowDemoCountryCodes[shuffledIndices[index]];
+        displayContryMapSmall(countryCode, x, y);
+    }
+}
+
+void drawFooterStatusDemo(const char* statusText) {
+    const char* text = (statusText != nullptr && statusText[0] != '\0') ? statusText : "439.500 MHz | TS2 | 4 heard today";
+    const uint16_t textColor = tft.color565(205, 215, 225);
+
+    const int y = 228;
+    const int height = 12;
+
+    tft.fillRect(0, y, tft.width(), height, TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(textColor, TFT_BLACK);
+    tft.setFreeFont(&RobotoMonoRegular10px7b);
+    tft.drawString(text, tft.width() / 2, y);
+
+    tft.setFreeFont(nullptr);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void renderCountryMapDemo(const char* countryCode) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Country map test", 8, 8, FONT_SIZE);
+    tft.drawString(countryCode, 230, 8, FONT_SIZE);
+
+    displayContryMapLarge(countryCode, 8, 40);
+    displayContryMapSmall(countryCode, 220, 40);
+}
+
+void updateCountryMapDemo() {
+    const unsigned long now = millis();
+    if (now < g_nextCountryMapDemoMs) {
+        return;
+    }
+
+    const bool usingLiveCode = looksLikeCountryCode(g_live.source_country_code) ||
+                                                         looksLikeCountryCode(g_snapshot.station_country_code);
+    const char* countryCode = currentDemoCountryCode();
+    renderCountryMapDemo(countryCode);
+
+    if (!usingLiveCode) {
+        g_demoCountryIndex = (g_demoCountryIndex + 1) % kDemoCountryCodeCount;
+    }
+
+    g_nextCountryMapDemoMs = now + COUNTRY_MAP_DEMO_INTERVAL_MS;
+}
+
+
+// Print Touchscreen info about X, Y and Pressure (Z) on the Serial Monitor
+void printTouchToSerial(int touchX, int touchY, int touchZ) {
+  Serial.print("X = ");
+  Serial.print(touchX);
+  Serial.print(" | Y = ");
+  Serial.print(touchY);
+  Serial.print(" | Pressure = ");
+  Serial.print(touchZ);
+  Serial.println();
+}
+
+// Print Touchscreen info about X, Y and Pressure (Z) on the TFT Display
+void printTouchToDisplay(int touchX, int touchY, int touchZ) {
+  // Clear TFT screen
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+    int centerX = tft.width() / 2;
+  int textY = 80;
+ 
+  String tempText = "X = " + String(touchX);
+  tft.drawCentreString(tempText, centerX, textY, FONT_SIZE);
+
+  textY += 20;
+  tempText = "Y = " + String(touchY);
+  tft.drawCentreString(tempText, centerX, textY, FONT_SIZE);
+
+  textY += 20;
+  tempText = "Pressure = " + String(touchZ);
+  tft.drawCentreString(tempText, centerX, textY, FONT_SIZE);
+}
+
+
+
+
 // Setup / loop
 
 void setup() {
     Serial.begin(115200);
+
+
+// Start the SPI for the touchscreen and init the touchscreen
+  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  touchscreen.begin(touchscreenSPI);
+  // Set the Touchscreen rotation in landscape mode
+  // Note: in some displays, the touchscreen might be upside down, so you might need to set the rotation to 3: touchscreen.setRotation(3);
+  touchscreen.setRotation(1);
+
+  // Start the tft display
+  tft.init();
+  // Set the TFT display rotation in landscape mode
+  tft.setRotation(1);
+    tft.setSwapBytes(true);
+
+    if (!SPIFFS.begin(true)) {
+        Serial.println("[SPIFFS] Mount failed");
+    } else {
+        Serial.println("[SPIFFS] Mounted");
+    }
+
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setCallback(tftJpegOutput);
+
+  // Clear the screen before writing to it
+  tft.fillScreen(TFT_BLACK);
+    randomSeed(micros());
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    drawTopCallsignFontDemo("HB9IIU");
+    drawClockDemo("19:45");
+    drawActivityStatusBannerDemo("RX");
+    drawFlagAndCallsignDemo("US", "KC9WX");
+    drawNameFontDemo("PAUL");
+    drawDurationMetricDemo("0:42");
+    drawRssiMetricDemo("-73");
+    drawBerMetricDemo("xx");
+    drawLossMetricDemo("yy");
+    drawLocationFontDemo("KOKOMO, UNITED STATES");
+    drawTalkgroupRowDemo("TS2 WORLD WIDE");
+    drawRecentHeardFlagsDemo();
+    drawFooterStatusDemo("439.500 MHz | TS2 | 4 heard today");
+  
+
+
     clearSnapshotState();
     clearLiveState();
     clearHeardSummaryState();
@@ -519,7 +1024,23 @@ void setup() {
     ws.setReconnectInterval(5000);
     ws.enableHeartbeat(15000, 3000, 2);  // ping every 15s, pong timeout 3s, disconnect after 2 misses
 }
-
+// Touchscreen coordinates: (x, y) and pressure (z)
+int x, y, z;
 void loop() {
     ws.loop();
+        //updateCountryMapDemo();
+
+    // Checks if Touchscreen was touched, and prints X, Y and Pressure (Z) info on the TFT display and Serial Monitor
+  if (touchscreen.tirqTouched() && touchscreen.touched()) {
+    // Get Touchscreen points
+    TS_Point p = touchscreen.getPoint();
+    // Calibrate Touchscreen points with map function to the correct width and height
+    x = map(p.x, 200, 3700, 1, tft.width());
+    y = map(p.y, 240, 3800, 1, tft.height());
+    z = p.z;
+
+    printTouchToSerial(x, y, z);
+
+    delay(100);
+  }
 }

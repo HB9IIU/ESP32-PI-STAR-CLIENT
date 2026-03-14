@@ -1,0 +1,273 @@
+/*******************************************************
+ * Analog Meter with VU Meter and Splash Screen
+ * Author: Daniel (HB9IIU)
+ * Description: Displays an analog meter with a moving
+ * needle and VU meter using TFT_eSPI on ESP32.
+ *******************************************************/
+
+#include <TFT_eSPI.h> // TFT display library
+#include <SPI.h>      // SPI communication library
+#include <PNGdec.h>   // PNG decoder library for splash screen
+#include "splash.h"   // PNG image stored as C array
+#include <SPIFFS.h>
+using namespace fs;    // ✅ Ensure File class is recognized correctly
+
+// Constants and Macros
+#define M_SIZE 1.3333   // Meter size scale factor for rotation(1)
+#define TFT_GREY 0x5AEB // Custom grey color for background
+
+// Global Objects
+TFT_eSPI tft = TFT_eSPI();
+PNG png; // PNG decoder instance
+
+// Global Variables
+float ltx = 0;
+uint16_t osx = M_SIZE * 120, osy = M_SIZE * 120;
+uint32_t updateTime = 0;
+int old_analog = -999;
+
+int value[6] = {0};
+int old_value[6] = {-1};
+int d = 0;
+
+// Function Prototypes
+void plotNeedle(int value, uint8_t ms_delay);
+void displaySplashScreen(int duration);
+void drawVUMeter(int value);
+void analogMeter();
+void pngDraw(PNGDRAW *pDraw);
+
+// ============================
+// Function Implementations
+// ============================
+
+/**
+ * @brief Draws the analog meter background with color segments.
+ */
+void analogMeter()
+{
+    tft.fillRect(0, 0, M_SIZE * 239, M_SIZE * 126, TFT_GREY);
+    tft.fillRect(5, 3, M_SIZE * 230, M_SIZE * 119, TFT_WHITE);
+
+    tft.setTextColor(TFT_BLACK);
+
+    // Draw colored scale arcs
+    for (float i = -50; i < 50; i += 0.05)
+    {
+        int tl = 25;
+        float sx = cos((i - 90) * DEG_TO_RAD);
+        float sy = sin((i - 90) * DEG_TO_RAD);
+        float sx2 = cos((i + 0.1 - 90) * DEG_TO_RAD);
+        float sy2 = sin((i + 0.1 - 90) * DEG_TO_RAD);
+
+        int x0 = sx * (M_SIZE * 100 + tl) + M_SIZE * 120;
+        int y0 = sy * (M_SIZE * 100 + tl) + M_SIZE * 140;
+        int x1 = sx * M_SIZE * 100 + M_SIZE * 120;
+        int y1 = sy * M_SIZE * 100 + M_SIZE * 140;
+        int x2 = sx2 * (M_SIZE * 100 + tl) + M_SIZE * 120;
+        int y2 = sy2 * (M_SIZE * 100 + tl) + M_SIZE * 140;
+        int x3 = sx2 * M_SIZE * 100 + M_SIZE * 120;
+        int y3 = sy2 * M_SIZE * 100 + M_SIZE * 140;
+
+        float norm = (i + 50) / 100.0;
+        uint8_t r = (norm < 0.5) ? 255 : (uint8_t)((1.0 - (norm - 0.5) * 2) * 255);
+        uint8_t g = (norm < 0.5) ? (uint8_t)(norm * 2 * 255) : 255;
+
+        uint16_t color = tft.color565(r, g, 0);
+        tft.fillTriangle(x0, y0, x1, y1, x2, y2, color);
+        tft.fillTriangle(x1, y1, x2, y2, x3, y3, color);
+    }
+
+    tft.drawString("HB9IIU", M_SIZE * (5 + 230 - 40), M_SIZE * (119 - 20), 2);
+    tft.drawCentreString("Tuning", M_SIZE * 120, M_SIZE * 70, 4);
+    tft.drawRect(5, 3, M_SIZE * 230, M_SIZE * 119, TFT_BLACK);
+
+    plotNeedle(0, 0); // Reset needle to zero
+}
+
+/**
+ * @brief Draws a smooth VU meter based on the value.
+ *
+ * @param value Value from 0 to 100.
+ */
+void drawVUMeter(int value)
+{
+    const int numSegments = 30;
+    const int vuX = 10, vuY = 180;
+    const int vuWidth = 320, vuHeight = 30, gap = 1;
+
+    int segmentWidth = (vuWidth - (numSegments - 1) * gap) / numSegments;
+    int active = map(value, 0, 100, 0, numSegments);
+
+    for (int i = 0; i < numSegments; i++)
+    {
+        int x = vuX + i * (segmentWidth + gap);
+        float norm = (float)i / (numSegments - 1);
+
+        uint8_t r = (norm < 0.5) ? 255 : (uint8_t)((1.0 - (norm - 0.5) * 2) * 255);
+        uint8_t g = (norm < 0.5) ? (uint8_t)(norm * 2 * 255) : 255;
+
+        uint16_t color = (i < active) ? tft.color565(r, g, 0) : TFT_BLACK;
+        tft.fillRect(x, vuY, segmentWidth, vuHeight, color);
+    }
+}
+
+/**
+ * @brief Moves the needle smoothly to the target value.
+ *
+ * @param value Target needle value.
+ * @param ms_delay Delay between steps for animation.
+ */
+void plotNeedle(int value, uint8_t ms_delay)
+{
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+    if (value < -10)
+        value = -10;
+    if (value > 110)
+        value = 110;
+
+    while (old_analog != value)
+    {
+        old_analog += (old_analog < value) ? 1 : -1;
+        if (ms_delay == 0)
+            old_analog = value;
+
+        float sdeg = map(old_analog, -10, 110, -150, -30);
+        float sx = cos(sdeg * DEG_TO_RAD);
+        float sy = sin(sdeg * DEG_TO_RAD);
+        float tx = tan((sdeg + 90) * DEG_TO_RAD);
+
+        // Erase previous needle
+        tft.drawLine(M_SIZE * (120 + 20 * ltx), M_SIZE * (140 - 20), osx, osy, TFT_WHITE);
+
+        tft.setTextColor(TFT_BLACK);
+        tft.drawCentreString("Tuning", M_SIZE * 120, M_SIZE * 70, 4);
+
+        ltx = tx;
+        osx = M_SIZE * (sx * 98 + 120);
+        osy = M_SIZE * (sy * 98 + 140);
+
+        // Draw new needle
+        tft.drawLine(M_SIZE * (120 + 20 * ltx), M_SIZE * (140 - 20), osx, osy, TFT_MAGENTA);
+
+        if (abs(old_analog - value) < 10)
+            ms_delay += ms_delay / 5;
+        delay(ms_delay);
+    }
+}
+
+/**
+ * @brief Displays the splash screen using PNGdec library.
+ *
+ * @param duration Duration in ms to show the splash screen.
+ */
+void displaySplashScreen(int duration)
+{
+    digitalWrite(TFT_BACKLIGHT_ON, LOW);
+
+    int16_t rc = png.openFLASH((uint8_t *)fancySplash, sizeof(fancySplash), [](PNGDRAW *pDraw)
+                               {
+         uint16_t lineBuffer[480];
+         png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+         tft.pushImage(0, pDraw->y, pDraw->iWidth, 1, lineBuffer); });
+
+    if (rc == PNG_SUCCESS)
+    {
+        Serial.println("Splash screen loaded successfully.");
+        tft.startWrite();
+        uint32_t dt = millis();
+        png.decode(nullptr, 0);
+        Serial.printf("Displayed in %lu ms\n", millis() - dt);
+        tft.endWrite();
+    }
+
+    digitalWrite(TFT_BACKLIGHT_ON, HIGH);
+    delay(duration);
+}
+
+
+
+
+void displaySplashScreenFromFS(const char* path, int duration) {
+    digitalWrite(TFT_BACKLIGHT_ON, LOW);
+    File file = SPIFFS.open(path, "r");  
+
+    if (!file) {
+        Serial.println("Failed to open splash screen binary!");
+        return;
+    }
+
+    int16_t rc = png.open(file, [](PNGDRAW *pDraw) {
+        uint16_t lineBuffer[480];
+        png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xFFFFFFFF);
+        tft.pushImage(0, pDraw->y, pDraw->iWidth, 1, lineBuffer);
+    });
+
+    if (rc == PNG_SUCCESS) {
+        Serial.println("Splash screen loaded from SPIFFS.");
+        tft.startWrite();
+        png.decode(nullptr, 0);
+        tft.endWrite();
+    } else {
+        Serial.println("PNG decode failed.");
+    }
+
+    file.close();
+    digitalWrite(TFT_BACKLIGHT_ON, HIGH);
+    delay(duration);
+}
+
+
+
+/**
+ * @brief Arduino setup function.
+ */
+void setup()
+{
+
+    Serial.begin(115200);
+    delay(3000);
+    Serial.println("Hello");
+    if (!SPIFFS.begin(true))
+    {
+        Serial.println("Failed to mount SPIFFS!");
+        return;
+    }
+    else
+    {
+        Serial.println("SPIFFS successfully mounted!");
+        return;
+    }
+
+    tft.init();
+    tft.setRotation(1);
+    Serial.begin(57600);
+    tft.fillScreen(TFT_BLACK);
+
+    pinMode(TFT_BACKLIGHT_ON, OUTPUT);
+    digitalWrite(TFT_BACKLIGHT_ON, HIGH);
+    displaySplashScreenFromFS("/fancySplash.png", 5000);
+    displaySplashScreen(5000);
+    analogMeter();
+
+    updateTime = millis();
+}
+
+/**
+ * @brief Arduino main loop function.
+ */
+void loop()
+{
+    if (millis() >= updateTime)
+    {
+        updateTime = millis() + 35; // Update every 35 ms
+
+        // Generate a test sine wave
+        d = (d + 4) % 360;
+        value[0] = 50 + 50 * sin(d * DEG_TO_RAD);
+
+        plotNeedle(value[0], 0);
+        drawVUMeter(value[0]);
+    }
+}

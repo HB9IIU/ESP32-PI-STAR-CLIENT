@@ -1,0 +1,209 @@
+
+
+// Define meter size as 1 for tft.rotation(0) or 1.3333 for tft.rotation(1)
+#define M_SIZE 1.3333
+
+#include <TFT_eSPI.h> // Hardware-specific library
+#include <SPI.h>
+
+TFT_eSPI tft = TFT_eSPI();       // Invoke custom library
+
+#define TFT_GREY 0x5AEB
+
+float ltx = 0;    // Saved x coord of bottom of needle
+uint16_t osx = M_SIZE*120, osy = M_SIZE*120; // Saved x & y coords
+uint32_t updateTime = 0;       // time for next update
+
+int old_analog =  -999; // Value last displayed
+
+int value[6] = {0, 0, 0, 0, 0, 0};
+int old_value[6] = { -1, -1, -1, -1, -1, -1};
+int d = 0;
+
+
+void plotNeedle(int value, byte ms_delay);
+
+
+void drawVUMeter(int value) {
+  const int numSegments = 30;
+  const int vuX = 10;
+  const int vuY = 180;  // Start Y position
+  const int vuWidth = 320;
+  const int vuHeight = 30;
+  const int gap = 1;
+
+  int segmentWidth = (vuWidth - (numSegments - 1) * gap) / numSegments;
+  int active = map(value, 0, 100, 0, numSegments);  // Map 0–100 to segments
+
+  for (int i = 0; i < numSegments; i++) {
+    int x = vuX + i * (segmentWidth + gap);
+
+    // Smooth gradient color (0.0 to 1.0)
+    float norm = (float)i / (numSegments - 1);
+    uint8_t r, g;
+
+    if (norm < 0.5) {
+      // Red → Yellow
+      r = 255;
+      g = (uint8_t)(norm * 2.0 * 255);
+    } else {
+      // Yellow → Green
+      r = (uint8_t)((1.0 - (norm - 0.5) * 2.0) * 255);
+      g = 255;
+    }
+
+    uint16_t color = (i < active) ? tft.color565(r, g, 0) : TFT_BLACK;
+
+    tft.fillRect(x, vuY, segmentWidth, vuHeight, color);
+  }
+}
+
+
+  void analogMeter() {
+    tft.fillRect(0, 0, M_SIZE * 239, M_SIZE * 126, TFT_GREY);
+    tft.fillRect(5, 3, M_SIZE * 230, M_SIZE * 119, TFT_WHITE);
+    //tft.fillRect(5, 3, M_SIZE * 230, M_SIZE * 119, tft.color565(247, 213, 71));
+
+    tft.setTextColor(TFT_BLACK);
+  
+    // Higher-resolution gradient using small angular steps
+    for (float i = -50; i < 50; i += 0.05) {
+      int tl = 25;
+  
+      // First triangle side
+      float sx  = cos((i - 90) * 0.0174532925);
+      float sy  = sin((i - 90) * 0.0174532925);
+      float sx2 = cos((i + 0.1 - 90) * 0.0174532925);
+      float sy2 = sin((i + 0.1 - 90) * 0.0174532925);
+  
+      int x0 = sx  * (M_SIZE * 100 + tl) + M_SIZE * 120;
+      int y0 = sy  * (M_SIZE * 100 + tl) + M_SIZE * 140;
+      int x1 = sx  * M_SIZE * 100 + M_SIZE * 120;
+      int y1 = sy  * M_SIZE * 100 + M_SIZE * 140;
+      int x2 = sx2 * (M_SIZE * 100 + tl) + M_SIZE * 120;
+      int y2 = sy2 * (M_SIZE * 100 + tl) + M_SIZE * 140;
+      int x3 = sx2 * M_SIZE * 100 + M_SIZE * 120;
+      int y3 = sy2 * M_SIZE * 100 + M_SIZE * 140;
+  
+      // Normalized range from 0.0 to 1.0
+      float norm = (i + 50) / 100.0;
+      uint8_t r, g;
+  
+      if (norm < 0.5) {
+        r = 255;
+        g = (uint8_t)(norm * 2 * 255);
+      } else {
+        r = (uint8_t)((1.0 - (norm - 0.5) * 2) * 255);
+        g = 255;
+      }
+  
+      uint16_t color = tft.color565(r, g, 0);
+  
+      // Draw both triangles per segment
+      tft.fillTriangle(x0, y0, x1, y1, x2, y2, color);
+      tft.fillTriangle(x1, y1, x2, y2, x3, y3, color);
+    }
+  
+    // Optional decorative elements
+    tft.drawString("HB9IIU", M_SIZE * (5 + 230 - 40), M_SIZE * (119 - 20), 2);
+    tft.drawCentreString("Tuning", M_SIZE * 120, M_SIZE * 70, 4);
+    tft.drawRect(5, 3, M_SIZE * 230, M_SIZE * 119, TFT_BLACK);
+  
+    plotNeedle(0, 0); // Reset needle to zero
+  }
+  
+
+void plotNeedle(int value, byte ms_delay)
+{
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  char buf[8]; dtostrf(value, 4, 0, buf);
+  //tft.drawRightString(buf, M_SIZE*40, M_SIZE*(119 - 20), 2);
+
+  if (value < -10) value = -10; // Limit value to emulate needle end stops
+  if (value > 110) value = 110;
+
+  // Move the needle until new value reached
+  while (!(value == old_analog)) {
+    if (old_analog < value) old_analog++;
+    else old_analog--;
+
+    if (ms_delay == 0) old_analog = value; // Update immediately if delay is 0
+
+    float sdeg = map(old_analog, -10, 110, -150, -30); // Map value to angle
+    // Calculate tip of needle coords
+    float sx = cos(sdeg * 0.0174532925);
+    float sy = sin(sdeg * 0.0174532925);
+
+    // Calculate x delta of needle start (does not start at pivot point)
+    float tx = tan((sdeg + 90) * 0.0174532925);
+
+    // Erase old needle image
+    tft.drawLine(M_SIZE*(120 + 20 * ltx - 1), M_SIZE*(140 - 20), osx - 1, osy, TFT_WHITE);
+    tft.drawLine(M_SIZE*(120 + 20 * ltx), M_SIZE*(140 - 20), osx, osy, TFT_WHITE);
+    tft.drawLine(M_SIZE*(120 + 20 * ltx + 1), M_SIZE*(140 - 20), osx + 1, osy, TFT_WHITE);
+
+    //tft.drawLine(M_SIZE*(120 + 20 * ltx - 1), M_SIZE*(140 - 20), osx - 1, osy, tft.color565(247, 213, 71));
+    //tft.drawLine(M_SIZE*(120 + 20 * ltx), M_SIZE*(140 - 20), osx, osy, tft.color565(247, 213, 71));
+    //tft.drawLine(M_SIZE*(120 + 20 * ltx + 1), M_SIZE*(140 - 20), osx + 1, osy, tft.color565(247, 213, 71));
+
+
+
+
+    // Re-plot text under needle
+    tft.setTextColor(TFT_BLACK);
+    tft.drawCentreString("Tuning", M_SIZE*120, M_SIZE*70, 4); // // Comment out to avoid font 4
+
+    // Store new needle end coords for next erase
+    ltx = tx;
+    osx = M_SIZE*(sx * 98 + 120);
+    osy = M_SIZE*(sy * 98 + 140);
+
+    // Draw the needle in the new postion, magenta makes needle a bit bolder
+    // draws 3 lines to thicken needle
+    tft.drawLine(M_SIZE*(120 + 20 * ltx - 1), M_SIZE*(140 - 20), osx - 1, osy, TFT_RED);
+    tft.drawLine(M_SIZE*(120 + 20 * ltx), M_SIZE*(140 - 20), osx, osy, TFT_MAGENTA);
+    tft.drawLine(M_SIZE*(120 + 20 * ltx + 1), M_SIZE*(140 - 20), osx + 1, osy, TFT_RED);
+
+    // Slow needle down slightly as it approaches new postion
+    if (abs(old_analog - value) < 10) ms_delay += ms_delay / 5;
+
+    // Wait before next update
+    delay(ms_delay);
+  }
+}
+
+
+
+
+
+
+
+
+
+
+void setup(void) {
+  tft.init();
+  tft.setRotation(1);
+  Serial.begin(57600); // For debug
+  tft.fillScreen(TFT_BLACK);
+
+  analogMeter(); // Draw analogue meter
+
+  updateTime = millis(); // Next update time
+}
+
+
+void loop() {
+  if (updateTime <= millis()) {
+    updateTime = millis() + 10; // Update meter every 35 milliseconds
+ 
+    // Create a Sine wave for testing
+    d += 4; if (d >= 360) d = 0;
+    value[0] = 50 + 50 * sin((d + 0) * 0.0174532925);
+ 
+    plotNeedle(value[0], 0); // It takes between 2 and 12ms to replot the needle with zero delay
+    drawVUMeter(value[0]);
+
+}
+}
+
