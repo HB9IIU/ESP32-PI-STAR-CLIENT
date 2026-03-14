@@ -54,6 +54,9 @@ CLIENTS = set()
 
 SNAPSHOT_STATE = {
     "type": "snapshot",
+    "server_time_unix": 0,
+    "server_time_iso": "",
+    "server_utc_offset_sec": 0,
     "service": {
         "state": "",
         "main_pid": 0,
@@ -889,6 +892,17 @@ async def send_json(websocket, payload):
     await websocket.send(json.dumps(payload, separators=(",", ":")))
 
 
+def build_snapshot_payload():
+    payload = copy.deepcopy(SNAPSHOT_STATE)
+    now_local = datetime.now().astimezone()
+    utc_offset = now_local.utcoffset()
+
+    payload["server_time_unix"] = int(now_local.timestamp())
+    payload["server_time_iso"] = now_local.isoformat(timespec="seconds")
+    payload["server_utc_offset_sec"] = int(utc_offset.total_seconds()) if utc_offset else 0
+    return payload
+
+
 async def broadcast_live_state():
     if not CLIENTS:
         return
@@ -911,7 +925,7 @@ async def broadcast_snapshot_state():
         return
 
     dead_clients = []
-    payload = copy.deepcopy(SNAPSHOT_STATE)
+    payload = build_snapshot_payload()
 
     for ws in CLIENTS:
         try:
@@ -945,7 +959,7 @@ async def ws_handler(websocket):
     print("CLIENT CONNECTED")
 
     try:
-        await send_json(websocket, copy.deepcopy(SNAPSHOT_STATE))
+        await send_json(websocket, build_snapshot_payload())
         await send_json(websocket, copy.deepcopy(LIVE_STATE))
         await send_json(websocket, copy.deepcopy(HEARD_SUMMARY_STATE))
         await websocket.wait_closed()

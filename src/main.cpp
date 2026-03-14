@@ -3,6 +3,8 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
+#include <time.h>
+#include <sys/time.h>
 
 #define WIFI_SSID  "NO WIFI FOR YOU!!!"
 #define WIFI_PASS  "Nestle2010Nestle"
@@ -18,6 +20,10 @@ constexpr size_t MAX_HEARD_RECENT_ITEMS = 10;
 
 struct SnapshotState {
     char type[16];
+    bool server_time_valid;
+    int64_t server_time_unix;
+    char server_time_iso[40];
+    int server_utc_offset_sec;
     char service_state[16];
     int service_pid;
     char service_active_since[64];
@@ -103,6 +109,11 @@ struct HeardSummaryState {
 } g_heardSummary;
 
 WebSocketsClient ws;
+bool g_clockInitialized = false;
+int g_clockUtcOffsetSec = 0;
+char g_lastClockText[6] = "";
+
+void drawClockDemo(const char* timeText);
 
 // Helpers
 
@@ -212,6 +223,14 @@ bool isEmptyTalkerAliasEvent() {
 void printSnapshot(JsonVariantConst configVariant) {
     printDivider("PI-STAR SNAPSHOT");
     Serial.printf("Type              : %s\n", g_snapshot.type);
+    Serial.printf("Server Time Unix  : %s", g_snapshot.server_time_valid ? "" : "n/a");
+    if (g_snapshot.server_time_valid) {
+        Serial.printf("%lld\n", static_cast<long long>(g_snapshot.server_time_unix));
+    } else {
+        Serial.println();
+    }
+    Serial.printf("Server Time ISO   : %s\n", g_snapshot.server_time_iso);
+    Serial.printf("UTC Offset Sec    : %d\n", g_snapshot.server_utc_offset_sec);
     Serial.printf("Service State     : %s\n", g_snapshot.service_state);
     Serial.printf("Service PID       : %d\n", g_snapshot.service_pid);
     Serial.printf("Active Since      : %s\n", g_snapshot.service_active_since);
@@ -346,12 +365,74 @@ void storeConfigJson(JsonVariantConst configVariant) {
     g_snapshot.config_json_length = serializeJson(configVariant, g_snapshot.config_json, sizeof(g_snapshot.config_json));
 }
 
+void initializeClockFromSnapshot() {
+    if (g_clockInitialized || !g_snapshot.server_time_valid) {
+        return;
+    }
+
+    timeval timeValue = {};
+    timeValue.tv_sec = static_cast<time_t>(g_snapshot.server_time_unix);
+
+    if (settimeofday(&timeValue, nullptr) != 0) {
+        Serial.println("[TIME] Failed to initialize clock from snapshot");
+        return;
+    }
+
+    g_clockUtcOffsetSec = g_snapshot.server_utc_offset_sec;
+    g_clockInitialized = true;
+    g_lastClockText[0] = '\0';
+    Serial.printf("[TIME] Clock initialized from snapshot: %lld (%s)\n",
+        static_cast<long long>(g_snapshot.server_time_unix),
+        g_snapshot.server_time_iso);
+}
+
+void buildClockText(char* destination, size_t destinationSize) {
+    if (destinationSize == 0) {
+        return;
+    }
+
+    if (!g_clockInitialized) {
+        strlcpy(destination, "--:--", destinationSize);
+        return;
+    }
+
+    const time_t nowUtc = time(nullptr);
+    if (nowUtc <= 0) {
+        strlcpy(destination, "--:--", destinationSize);
+        return;
+    }
+
+    const time_t nowLocal = nowUtc + g_clockUtcOffsetSec;
+    struct tm timeInfo = {};
+    gmtime_r(&nowLocal, &timeInfo);
+
+    if (strftime(destination, destinationSize, "%H:%M", &timeInfo) == 0) {
+        strlcpy(destination, "--:--", destinationSize);
+    }
+}
+
+void updateClockDisplay(bool force = false) {
+    char clockText[6];
+    buildClockText(clockText, sizeof(clockText));
+
+    if (!force && strcmp(clockText, g_lastClockText) == 0) {
+        return;
+    }
+
+    drawClockDemo(clockText);
+    strlcpy(g_lastClockText, clockText, sizeof(g_lastClockText));
+}
+
 // Parsers
 
 void parseSnapshot(JsonDocument& doc) {
     clearSnapshotState();
 
     copyJsonString(doc["type"], g_snapshot.type, sizeof(g_snapshot.type));
+    g_snapshot.server_time_valid = !doc["server_time_unix"].isNull();
+    g_snapshot.server_time_unix = g_snapshot.server_time_valid ? doc["server_time_unix"].as<int64_t>() : 0;
+    copyJsonString(doc["server_time_iso"], g_snapshot.server_time_iso, sizeof(g_snapshot.server_time_iso));
+    g_snapshot.server_utc_offset_sec = doc["server_utc_offset_sec"] | 0;
     copyJsonString(doc["service"]["state"], g_snapshot.service_state, sizeof(g_snapshot.service_state));
     g_snapshot.service_pid = doc["service"]["main_pid"] | 0;
     copyJsonString(doc["service"]["active_since"], g_snapshot.service_active_since, sizeof(g_snapshot.service_active_since));
@@ -380,6 +461,9 @@ void parseSnapshot(JsonDocument& doc) {
     copyJsonString(doc["station_country"], g_snapshot.station_country, sizeof(g_snapshot.station_country));
     copyJsonString(doc["station_country_code"], g_snapshot.station_country_code, sizeof(g_snapshot.station_country_code));
     g_snapshot.valid = true;
+
+    initializeClockFromSnapshot();
+    updateClockDisplay(true);
 
     printSnapshot(doc["config"]);
 }
@@ -743,7 +827,7 @@ void drawActivityStatusBannerDemo(const char* statusText) {
 }
 
 void drawClockDemo(const char* timeText) {
-    const char* text = (timeText != nullptr && timeText[0] != '\0') ? timeText : "19:45";
+    const char* text = (timeText != nullptr && timeText[0] != '\0') ? timeText : "--:--";
     const uint16_t textColor = TFT_WHITE;
     const uint16_t backgroundColor = TFT_NAVY;
 
@@ -990,7 +1074,7 @@ void setup() {
     randomSeed(micros());
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
     drawTopCallsignFontDemo("HB9IIU");
-    drawClockDemo("19:45");
+        updateClockDisplay(true);
     drawActivityStatusBannerDemo("RX");
     drawFlagAndCallsignDemo("US", "KC9WX");
     drawNameFontDemo("PAUL");
@@ -1028,6 +1112,7 @@ void setup() {
 int x, y, z;
 void loop() {
     ws.loop();
+    updateClockDisplay();
         //updateCountryMapDemo();
 
     // Checks if Touchscreen was touched, and prints X, Y and Pressure (Z) info on the TFT display and Serial Monitor
