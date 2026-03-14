@@ -41,6 +41,11 @@ RADIOID_REFRESH_INTERVAL_SECONDS = 24 * 3600
 RADIOID_REFRESH_CHECK_INTERVAL_SECONDS = 300
 RADIOID_DOWNLOAD_TIMEOUT_SECONDS = 60
 
+HEARD_CALLSIGNS_FILE = os.path.join(APP_DIR, "heard_callsigns.json")
+HEARD_RECENT_LIMIT = 10
+HEARD_SAVE_INTERVAL_SECONDS = 300
+HEARD_SAVE_CHANGE_THRESHOLD = 25
+
 # ---------------------------------------------------------------------
 # GLOBAL STATE
 # ---------------------------------------------------------------------
@@ -55,12 +60,20 @@ SNAPSHOT_STATE = {
         "active_since": ""
     },
     "config_mtime": "",
-    "config_mtime_ago_days": 0.0,
+    "config_mtime_ago_hours": 0,
     "current_log_file": "",
     "config": {},
     "radioid_csv_file": RADIOID_LOCAL_CSV,
+    "radioid_csv_exists": False,
     "radioid_csv_mtime": "",
+    "radioid_csv_age_hours": 0,
+    "radioid_csv_is_stale": True,
     "radioid_entries": 0,
+    "radioid_lookup_loaded": False,
+    "radioid_status": "uninitialized",
+    "radioid_last_refresh_attempt": "",
+    "radioid_last_refresh_success": "",
+    "radioid_last_refresh_error": "",
     "station_callsign": "",
     "station_match_count": 0,
     "station_id": "",
@@ -97,6 +110,14 @@ LIVE_STATE = {
     "ber_percent": None,
     "rssi_values_dbm": [],
     "raw_line": ""
+}
+
+HEARD_SUMMARY_STATE = {
+    "type": "heard_summary",
+    "unique_callsigns_total": 0,
+    "last_heard_callsign": "",
+    "last_heard_at": "",
+    "recent": []
 }
 
 # ---------------------------------------------------------------------
@@ -207,11 +228,11 @@ def format_timestamp_utc(timestamp_value):
     return datetime.fromtimestamp(timestamp_value, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def calculate_age_days(timestamp_value):
+def calculate_age_hours(timestamp_value):
     if not timestamp_value:
-        return 0.0
+        return 0
     age_seconds = max(0.0, time.time() - timestamp_value)
-    return round(age_seconds / 86400.0, 2)
+    return int(age_seconds // 3600)
 
 # ---------------------------------------------------------------------
 # COUNTRY LOOKUP
@@ -249,10 +270,26 @@ COUNTRY_NAME_TO_ISO = {
 # ---------------------------------------------------------------------
 
 RADIOID_BY_CALLSIGN = {}
+RADIOID_LOOKUP_LOADED = False
+RADIOID_LAST_REFRESH_ATTEMPT_TS = 0.0
+RADIOID_LAST_REFRESH_SUCCESS_TS = 0.0
+RADIOID_LAST_REFRESH_ERROR = ""
+HEARD_CALLSIGNS = {}
+HEARD_DB_DIRTY = False
+HEARD_DB_PENDING_CHANGES = 0
 
 
 def normalize_callsign(value):
     return str(value).strip().upper()
+
+
+def looks_like_real_callsign(value):
+    normalized = normalize_callsign(value)
+    if not normalized:
+        return False
+    if normalized.isdigit():
+        return False
+    return any(character.isalpha() for character in normalized)
 
 
 def empty_radioid_record():
@@ -267,6 +304,214 @@ def empty_radioid_record():
         "country": "",
         "country_code": ""
     }
+
+
+def make_heard_summary_item(record):
+    return {
+        "callsign": record.get("callsign", ""),
+        "name": record.get("name", ""),
+        "country_code": record.get("country_code", ""),
+        "last_seen": record.get("last_seen", ""),
+        "last_tg": record.get("last_tg", "")
+    }
+
+
+def rebuild_heard_summary_state():
+    ordered_records = sorted(
+        HEARD_CALLSIGNS.values(),
+        key=lambda record: (record.get("last_seen", ""), record.get("callsign", "")),
+        reverse=True
+    )
+
+    HEARD_SUMMARY_STATE["unique_callsigns_total"] = len(HEARD_CALLSIGNS)
+    if ordered_records:
+        HEARD_SUMMARY_STATE["last_heard_callsign"] = ordered_records[0].get("callsign", "")
+        HEARD_SUMMARY_STATE["last_heard_at"] = ordered_records[0].get("last_seen", "")
+    else:
+        HEARD_SUMMARY_STATE["last_heard_callsign"] = ""
+        HEARD_SUMMARY_STATE["last_heard_at"] = ""
+
+    HEARD_SUMMARY_STATE["recent"] = [
+        make_heard_summary_item(record)
+        for record in ordered_records[:HEARD_RECENT_LIMIT]
+    ]
+
+
+def load_heard_callsigns_file():
+    global HEARD_CALLSIGNS
+    global HEARD_DB_DIRTY
+    global HEARD_DB_PENDING_CHANGES
+
+    if not os.path.isfile(HEARD_CALLSIGNS_FILE):
+        HEARD_CALLSIGNS = {}
+        HEARD_DB_DIRTY = False
+        HEARD_DB_PENDING_CHANGES = 0
+        rebuild_heard_summary_state()
+        return
+
+    try:
+        with open(HEARD_CALLSIGNS_FILE, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            raise RuntimeError("heard callsigns file does not contain a JSON object")
+
+        normalized_data = {}
+        removed_entries = 0
+        for callsign, record in data.items():
+            normalized_callsign = normalize_callsign(callsign)
+            if not normalized_callsign or not isinstance(record, dict):
+                removed_entries += 1
+                continue
+
+            stored_callsign = record.get("callsign", normalized_callsign)
+            if not looks_like_real_callsign(stored_callsign):
+                removed_entries += 1
+                continue
+
+            normalized_record = {
+                "callsign": normalized_callsign,
+                "id": str(record.get("id", "")),
+                "name": str(record.get("name", "")),
+                "city": str(record.get("city", "")),
+                "state": str(record.get("state", "")),
+                "country": str(record.get("country", "")),
+                "country_code": str(record.get("country_code", "")),
+                "first_seen": str(record.get("first_seen", "")),
+                "last_seen": str(record.get("last_seen", "")),
+                "seen_count": int(record.get("seen_count", 0) or 0),
+                "last_tg": str(record.get("last_tg", "")),
+                "last_slot": record.get("last_slot", None),
+                "last_direction": str(record.get("last_direction", ""))
+            }
+            normalized_data[normalized_callsign] = normalized_record
+
+        HEARD_CALLSIGNS = normalized_data
+        HEARD_DB_DIRTY = removed_entries > 0
+        HEARD_DB_PENDING_CHANGES = removed_entries
+        rebuild_heard_summary_state()
+        print("Heard callsigns loaded: %d entries" % len(HEARD_CALLSIGNS))
+        if removed_entries > 0:
+            print("Heard callsigns cleanup removed %d invalid entries" % removed_entries)
+    except Exception as exc:
+        HEARD_CALLSIGNS = {}
+        HEARD_DB_DIRTY = False
+        HEARD_DB_PENDING_CHANGES = 0
+        rebuild_heard_summary_state()
+        print("Warning: failed to load heard callsigns file: %s" % exc)
+
+
+def save_heard_callsigns_file():
+    global HEARD_DB_DIRTY
+    global HEARD_DB_PENDING_CHANGES
+
+    if not HEARD_DB_DIRTY:
+        return
+
+    temp_path = HEARD_CALLSIGNS_FILE + ".tmp"
+    payload = {
+        callsign: HEARD_CALLSIGNS[callsign]
+        for callsign in sorted(HEARD_CALLSIGNS.keys())
+    }
+
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=False)
+        f.write("\n")
+
+    os.replace(temp_path, HEARD_CALLSIGNS_FILE)
+    HEARD_DB_DIRTY = False
+    HEARD_DB_PENDING_CHANGES = 0
+
+
+def update_heard_callsigns_from_live_state():
+    global HEARD_DB_DIRTY
+    global HEARD_DB_PENDING_CHANGES
+
+    if LIVE_STATE["last_event"] not in ("rf_voice_header", "network_voice_header"):
+        return False
+
+    preferred_callsign = LIVE_STATE["source_callsign"]
+    fallback_callsign = LIVE_STATE["source"]
+
+    if looks_like_real_callsign(preferred_callsign):
+        callsign = normalize_callsign(preferred_callsign)
+    elif looks_like_real_callsign(fallback_callsign):
+        callsign = normalize_callsign(fallback_callsign)
+    else:
+        return False
+
+    if not callsign:
+        return False
+
+    record = HEARD_CALLSIGNS.get(callsign)
+    if record is None:
+        record = {
+            "callsign": callsign,
+            "id": LIVE_STATE["source_id"],
+            "name": LIVE_STATE["source_name"],
+            "city": LIVE_STATE["source_city"],
+            "state": LIVE_STATE["source_state"],
+            "country": LIVE_STATE["source_country"],
+            "country_code": LIVE_STATE["source_country_code"],
+            "first_seen": LIVE_STATE["timestamp"],
+            "last_seen": LIVE_STATE["timestamp"],
+            "seen_count": 1,
+            "last_tg": LIVE_STATE["destination"],
+            "last_slot": LIVE_STATE["slot"],
+            "last_direction": LIVE_STATE["direction"]
+        }
+        HEARD_CALLSIGNS[callsign] = record
+    else:
+        if LIVE_STATE["source_id"]:
+            record["id"] = LIVE_STATE["source_id"]
+        if LIVE_STATE["source_name"]:
+            record["name"] = LIVE_STATE["source_name"]
+        if LIVE_STATE["source_city"]:
+            record["city"] = LIVE_STATE["source_city"]
+        if LIVE_STATE["source_state"]:
+            record["state"] = LIVE_STATE["source_state"]
+        if LIVE_STATE["source_country"]:
+            record["country"] = LIVE_STATE["source_country"]
+        if LIVE_STATE["source_country_code"]:
+            record["country_code"] = LIVE_STATE["source_country_code"]
+        if not record.get("first_seen"):
+            record["first_seen"] = LIVE_STATE["timestamp"]
+        record["last_seen"] = LIVE_STATE["timestamp"]
+        record["seen_count"] = int(record.get("seen_count", 0) or 0) + 1
+        record["last_tg"] = LIVE_STATE["destination"]
+        record["last_slot"] = LIVE_STATE["slot"]
+        record["last_direction"] = LIVE_STATE["direction"]
+
+    HEARD_DB_DIRTY = True
+    HEARD_DB_PENDING_CHANGES += 1
+    rebuild_heard_summary_state()
+    return True
+
+
+def get_radioid_status():
+    if not os.path.isfile(RADIOID_LOCAL_CSV):
+        return "missing"
+    if not RADIOID_LOOKUP_LOADED:
+        return "not_loaded"
+    if radioid_csv_is_stale():
+        return "stale"
+    return "ready"
+
+
+def update_radioid_snapshot_metadata():
+    radioid_csv_exists = os.path.isfile(RADIOID_LOCAL_CSV)
+    radioid_csv_mtime = get_file_mtime(RADIOID_LOCAL_CSV)
+
+    SNAPSHOT_STATE["radioid_csv_file"] = RADIOID_LOCAL_CSV
+    SNAPSHOT_STATE["radioid_csv_exists"] = radioid_csv_exists
+    SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
+    SNAPSHOT_STATE["radioid_csv_age_hours"] = calculate_age_hours(radioid_csv_mtime)
+    SNAPSHOT_STATE["radioid_csv_is_stale"] = radioid_csv_is_stale() if radioid_csv_exists else True
+    SNAPSHOT_STATE["radioid_lookup_loaded"] = RADIOID_LOOKUP_LOADED
+    SNAPSHOT_STATE["radioid_status"] = get_radioid_status()
+    SNAPSHOT_STATE["radioid_last_refresh_attempt"] = format_timestamp_utc(RADIOID_LAST_REFRESH_ATTEMPT_TS)
+    SNAPSHOT_STATE["radioid_last_refresh_success"] = format_timestamp_utc(RADIOID_LAST_REFRESH_SUCCESS_TS)
+    SNAPSHOT_STATE["radioid_last_refresh_error"] = RADIOID_LAST_REFRESH_ERROR
 
 
 def download_radioid_csv():
@@ -309,6 +554,7 @@ def radioid_csv_is_stale():
 
 def load_radioid_csv(filepath):
     global RADIOID_BY_CALLSIGN
+    global RADIOID_LOOKUP_LOADED
 
     new_db = {}
     total_rows = 0
@@ -353,13 +599,43 @@ def load_radioid_csv(filepath):
             else:
                 new_db[callsign]["match_count"] += 1
 
-    radioid_csv_mtime = get_file_mtime(filepath)
-
     RADIOID_BY_CALLSIGN = new_db
+    RADIOID_LOOKUP_LOADED = True
     SNAPSHOT_STATE["radioid_entries"] = len(RADIOID_BY_CALLSIGN)
-    SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
+    update_radioid_snapshot_metadata()
 
     print("RadioID DB loaded: %d callsigns from %d CSV rows" % (len(RADIOID_BY_CALLSIGN), total_rows))
+
+
+def refresh_radioid_database(download_if_needed):
+    global RADIOID_LAST_REFRESH_ATTEMPT_TS
+    global RADIOID_LAST_REFRESH_SUCCESS_TS
+    global RADIOID_LAST_REFRESH_ERROR
+    global RADIOID_LOOKUP_LOADED
+
+    RADIOID_LAST_REFRESH_ATTEMPT_TS = time.time()
+    RADIOID_LAST_REFRESH_ERROR = ""
+
+    try:
+        needs_download = not os.path.isfile(RADIOID_LOCAL_CSV)
+        if download_if_needed and (needs_download or radioid_csv_is_stale()):
+            if needs_download:
+                print("RadioID CSV not found, downloading...")
+            else:
+                print("RadioID CSV is stale, refreshing...")
+            download_radioid_csv()
+        elif needs_download:
+            raise RuntimeError("RadioID CSV file is missing")
+
+        load_radioid_csv(RADIOID_LOCAL_CSV)
+        RADIOID_LAST_REFRESH_SUCCESS_TS = time.time()
+        update_radioid_snapshot_metadata()
+    except Exception as exc:
+        RADIOID_LOOKUP_LOADED = False
+        SNAPSHOT_STATE["radioid_entries"] = 0
+        RADIOID_LAST_REFRESH_ERROR = str(exc)
+        update_radioid_snapshot_metadata()
+        raise
 
 
 def lookup_callsign(callsign):
@@ -402,13 +678,10 @@ def rebuild_snapshot_state():
     SNAPSHOT_STATE["service"]["main_pid"] = get_service_main_pid()
     SNAPSHOT_STATE["service"]["active_since"] = get_service_active_since()
     SNAPSHOT_STATE["config_mtime"] = format_timestamp_utc(config_mtime)
-    SNAPSHOT_STATE["config_mtime_ago_days"] = calculate_age_days(config_mtime)
+    SNAPSHOT_STATE["config_mtime_ago_hours"] = calculate_age_hours(config_mtime)
     SNAPSHOT_STATE["current_log_file"] = find_latest_log_file()
     SNAPSHOT_STATE["config"] = parse_mmdvm_config_file()
-    radioid_csv_mtime = get_file_mtime(RADIOID_LOCAL_CSV)
-
-    SNAPSHOT_STATE["radioid_csv_file"] = RADIOID_LOCAL_CSV
-    SNAPSHOT_STATE["radioid_csv_mtime"] = format_timestamp_utc(radioid_csv_mtime)
+    update_radioid_snapshot_metadata()
 
     station_callsign = SNAPSHOT_STATE["config"].get("General", {}).get("Callsign", "")
     station_info = lookup_callsign(station_callsign)
@@ -650,6 +923,23 @@ async def broadcast_snapshot_state():
         CLIENTS.discard(ws)
 
 
+async def broadcast_heard_summary_state():
+    if not CLIENTS:
+        return
+
+    dead_clients = []
+    payload = copy.deepcopy(HEARD_SUMMARY_STATE)
+
+    for ws in CLIENTS:
+        try:
+            await send_json(ws, payload)
+        except Exception:
+            dead_clients.append(ws)
+
+    for ws in dead_clients:
+        CLIENTS.discard(ws)
+
+
 async def ws_handler(websocket):
     CLIENTS.add(websocket)
     print("CLIENT CONNECTED")
@@ -657,6 +947,7 @@ async def ws_handler(websocket):
     try:
         await send_json(websocket, copy.deepcopy(SNAPSHOT_STATE))
         await send_json(websocket, copy.deepcopy(LIVE_STATE))
+        await send_json(websocket, copy.deepcopy(HEARD_SUMMARY_STATE))
         await websocket.wait_closed()
     finally:
         CLIENTS.discard(websocket)
@@ -670,15 +961,38 @@ async def radioid_refresh_loop():
     while True:
         try:
             if radioid_csv_is_stale():
-                print("RadioID CSV is stale, refreshing...")
-                download_radioid_csv()
-                load_radioid_csv(RADIOID_LOCAL_CSV)
+                refresh_radioid_database(download_if_needed=True)
                 rebuild_snapshot_state()
                 await broadcast_snapshot_state()
         except Exception as e:
             print("Warning: RadioID refresh failed: %s" % e)
+            rebuild_snapshot_state()
+            await broadcast_snapshot_state()
 
         await asyncio.sleep(RADIOID_REFRESH_CHECK_INTERVAL_SECONDS)
+
+
+async def heard_callsigns_flush_loop():
+    last_save_monotonic = time.monotonic()
+
+    while True:
+        await asyncio.sleep(5)
+
+        if not HEARD_DB_DIRTY:
+            continue
+
+        now_monotonic = time.monotonic()
+        should_save = HEARD_DB_PENDING_CHANGES >= HEARD_SAVE_CHANGE_THRESHOLD
+        should_save = should_save or (now_monotonic - last_save_monotonic >= HEARD_SAVE_INTERVAL_SECONDS)
+
+        if not should_save:
+            continue
+
+        try:
+            save_heard_callsigns_file()
+            last_save_monotonic = now_monotonic
+        except Exception as exc:
+            print("Warning: failed to save heard callsigns file: %s" % exc)
 
 # ---------------------------------------------------------------------
 # LOG MONITOR
@@ -687,9 +1001,9 @@ async def radioid_refresh_loop():
 async def monitor_log_forever():
     rebuild_snapshot_state()
     reset_live_state()
+    load_heard_callsigns_file()
 
-    ensure_radioid_csv_present()
-    load_radioid_csv(RADIOID_LOCAL_CSV)
+    refresh_radioid_database(download_if_needed=True)
     rebuild_snapshot_state()
 
     current_log_file = SNAPSHOT_STATE["current_log_file"]
@@ -706,8 +1020,11 @@ async def monitor_log_forever():
 
         if line:
             if update_live_state_from_log_line(line):
+                heard_summary_changed = update_heard_callsigns_from_live_state()
                 print(json.dumps(LIVE_STATE, indent=2))
                 await broadcast_live_state()
+                if heard_summary_changed:
+                    await broadcast_heard_summary_state()
         else:
             await asyncio.sleep(LOG_POLL_INTERVAL_SECONDS)
 
@@ -751,26 +1068,37 @@ async def monitor_log_forever():
 async def main():
     rebuild_snapshot_state()
     reset_live_state()
+    load_heard_callsigns_file()
 
-    ensure_radioid_csv_present()
-    load_radioid_csv(RADIOID_LOCAL_CSV)
+    refresh_radioid_database(download_if_needed=True)
     rebuild_snapshot_state()
 
     print("WebSocket server running on port %d" % WS_BIND_PORT)
     print("Current log file: %s" % SNAPSHOT_STATE["current_log_file"])
     print("RadioID CSV file: %s" % RADIOID_LOCAL_CSV)
+    print("Heard callsigns file: %s" % HEARD_CALLSIGNS_FILE)
 
     refresh_task = asyncio.create_task(radioid_refresh_loop())
+    heard_flush_task = asyncio.create_task(heard_callsigns_flush_loop())
 
     try:
         async with websockets.serve(ws_handler, WS_BIND_HOST, WS_BIND_PORT):
             await monitor_log_forever()
     finally:
         refresh_task.cancel()
+        heard_flush_task.cancel()
         try:
             await refresh_task
         except asyncio.CancelledError:
             pass
+        try:
+            await heard_flush_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            save_heard_callsigns_file()
+        except Exception as exc:
+            print("Warning: failed to save heard callsigns file during shutdown: %s" % exc)
 
 
 if __name__ == "__main__":
